@@ -28,7 +28,7 @@ COPY LICENSE ./LICENSE
 COPY docker/entrypoint-embedded.sh /usr/local/bin/entrypoint-embedded.sh
 RUN chmod +x /usr/local/bin/entrypoint-embedded.sh
 
-RUN mkdir -p /app/logs && chown -R providarr:providarr /app/logs
+RUN mkdir -p /app/logs && chown -R providarr:providarr /app/logs /app/config
 
 ENV PROVIDARR_CONFIG=/app/config/config.json \
     PGDATA=/var/lib/postgresql/data \

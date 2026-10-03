@@ -152,16 +152,18 @@ pub struct AppConfig {
 impl AppConfig {
     /// Load config from `PROVIDARR_CONFIG` (default `config/config.json`).
     ///
-    /// A missing file is not fatal: built-in defaults are used. Environment
-    /// variables override the values that matter for deployment.
+    /// If the file does not exist a default one is written to that path (so a
+    /// fresh deployment or an empty bind mount gets an editable config). If it
+    /// cannot be written, the in-memory defaults are used and startup still
+    /// succeeds. Environment variables override the values that matter for
+    /// deployment.
     pub fn load() -> Result<Self, AppError> {
-        // An explicitly-set `PROVIDARR_CONFIG` is authoritative: if it points at
-        // a missing file that is a hard error, not a silent fall back to
-        // defaults. Only the implicit default path may be absent.
-        let explicit_config = std::env::var("PROVIDARR_CONFIG").ok();
-        let path = explicit_config
-            .clone()
-            .unwrap_or_else(|| "config/config.json".to_string());
+        // `PROVIDARR_CONFIG` selects the path; a missing file is never fatal
+        // (defaults + environment overrides are used) so a bind-mounted or
+        // not-yet-populated config directory cannot prevent startup. The
+        // symlink / non-regular-file checks below still reject unsafe paths.
+        let path =
+            std::env::var("PROVIDARR_CONFIG").unwrap_or_else(|_| "config/config.json".to_string());
 
         // `symlink_metadata` does not follow symlinks, so a symlinked config is
         // rejected instead of silently resolved. A missing file keeps the
@@ -190,13 +192,18 @@ impl AppConfig {
                     .map_err(|e| AppError::Config(format!("failed to parse {path}: {e}")))?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if explicit_config.is_some() {
-                    return Err(AppError::Config(format!(
-                        "config file {path:?} from PROVIDARR_CONFIG does not exist"
-                    )));
+                let default = AppConfig::default();
+                match write_default_config(&path, &default) {
+                    Ok(()) => {
+                        tracing::info!(path, "config file not found; wrote default configuration")
+                    }
+                    Err(write_err) => tracing::warn!(
+                        path,
+                        error = %write_err,
+                        "config file not found and could not be created; using in-memory defaults"
+                    ),
                 }
-                tracing::warn!(path, "config file not found, using defaults");
-                AppConfig::default()
+                default
             }
             Err(e) => {
                 return Err(AppError::Config(format!(
@@ -446,6 +453,37 @@ impl AppConfig {
     pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
         self.providers.get(name)
     }
+}
+
+/// Writes the built-in default configuration to `path` so a fresh deployment
+/// (or an empty bind-mounted config directory) has an editable file. Written
+/// atomically with restrictive permissions; a read-only filesystem is not fatal
+/// and the caller falls back to the in-memory defaults.
+fn write_default_config(path: &str, config: &AppConfig) -> std::io::Result<()> {
+    let path_ref = std::path::Path::new(path);
+    if let Some(parent) = path_ref.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_vec_pretty(config).map_err(std::io::Error::other)?;
+
+    let temp = path_ref.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        std::io::Write::write_all(&mut file, &json)?;
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&temp, path_ref)
 }
 
 /// Applies `PROVIDARR_INBOUND_*` environment overrides on top of the JSON/default config.

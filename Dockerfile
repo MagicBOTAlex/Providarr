@@ -26,7 +26,7 @@ COPY --from=builder /build/target/release/providarr /usr/local/bin/providarr
 COPY config ./config
 COPY LICENSE ./LICENSE
 
-RUN mkdir -p /app/logs && chown -R providarr:providarr /app/logs
+RUN mkdir -p /app/logs && chown -R providarr:providarr /app/logs /app/config
 
 USER providarr
 ENV PROVIDARR_CONFIG=/app/config/config.json
