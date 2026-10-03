@@ -2,6 +2,11 @@ use std::time::Duration;
 
 use providarr::{api, config::AppConfig, state::AppState, telemetry};
 
+/// Retention window for the append-only accounting tables. Rows older than this
+/// are pruned by the hourly maintenance task. Kept as a constant rather than a
+/// config field so the bound cannot be accidentally disabled in deployment.
+const RETENTION_WINDOW: Duration = Duration::from_secs(60 * 60 * 24 * 30);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -27,6 +32,15 @@ async fn main() -> anyhow::Result<()> {
         );
     } else {
         tracing::warn!("inbound per-IP rate limiter is DISABLED (PROVIDARR_INBOUND_ENABLED=false)");
+    }
+
+    let api_auth = &state.config.api_auth;
+    if api_auth.enabled && api_auth.api_key.is_empty() {
+        tracing::warn!(
+            "API authentication is ENABLED but no api_key is configured; \
+             authenticated routes are inaccessible and unauthenticated routes are \
+             rejected with 401"
+        );
     }
 
     spawn_background_tasks(state.clone());
@@ -69,6 +83,33 @@ fn spawn_background_tasks(state: AppState) {
                 }
                 Ok(_) => {}
                 Err(err) => tracing::warn!(error = %err, "failed to purge cache"),
+            }
+        }
+    });
+
+    // Bound append-only accounting tables so `endpoint_stats` and
+    // `rate_limit_events` cannot grow without limit.
+    let retention_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            match providarr::db::prune_endpoint_stats(&retention_state.pool, RETENTION_WINDOW).await
+            {
+                Ok(pruned) if pruned > 0 => {
+                    tracing::info!(pruned, "pruned stale endpoint_stats rows");
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = %err, "failed to prune endpoint_stats"),
+            }
+            match providarr::db::prune_rate_limit_events(&retention_state.pool, RETENTION_WINDOW)
+                .await
+            {
+                Ok(pruned) if pruned > 0 => {
+                    tracing::info!(pruned, "pruned stale rate_limit_events rows");
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = %err, "failed to prune rate_limit_events"),
             }
         }
     });
