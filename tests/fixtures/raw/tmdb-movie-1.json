@@ -1,0 +1,132 @@
+{
+  "adult": false,
+  "backdrop_path": "/synthetic-backdrop.jpg",
+  "belongs_to_collection": null,
+  "budget": 1000000,
+  "genres": [
+    { "id": 18, "name": "Drama" },
+    { "id": 35, "name": "Comedy" }
+  ],
+  "homepage": "https://example.com/synthetic-feature",
+  "id": 1,
+  "imdb_id": "tt0000001",
+  "origin_country": ["US"],
+  "original_language": "en",
+  "original_title": "Synthetic Original",
+  "overview": "Synthetic overview.",
+  "popularity": 1.5,
+  "poster_path": "/synthetic-poster.jpg",
+  "production_companies": [
+    { "id": 1, "logo_path": null, "name": "Synthetic Studios", "origin_country": "US" }
+  ],
+  "production_countries": [
+    { "iso_3166_1": "US", "name": "United States of America" }
+  ],
+  "release_date": "2020-01-02",
+  "revenue": 0,
+  "runtime": 120,
+  "spoken_languages": [
+    { "english_name": "English", "iso_639_1": "en", "name": "English" }
+  ],
+  "status": "Released",
+  "tagline": "A synthetic tagline.",
+  "title": "Synthetic Feature",
+  "video": false,
+  "vote_average": 7.5,
+  "vote_count": 10,
+  "credits": {
+    "cast": [
+      {
+        "id": 1,
+        "name": "Synthetic Actor",
+        "order": 0,
+        "character": "Synthetic Character",
+        "credit_id": "synthetic-credit-1",
+        "profile_path": "/synthetic-actor.jpg"
+      }
+    ],
+    "crew": [
+      {
+        "id": 2,
+        "name": "Synthetic Director",
+        "order": 0,
+        "job": "Director",
+        "department": "Directing",
+        "credit_id": "synthetic-credit-2",
+        "profile_path": null
+      }
+    ]
+  },
+  "external_ids": {
+    "imdb_id": "tt0000001",
+    "wikidata_id": null,
+    "facebook_id": null,
+    "instagram_id": null,
+    "twitter_id": null
+  },
+  "release_dates": {
+    "results": [
+      {
+        "iso_3166_1": "US",
+        "release_dates": [
+          {
+            "certification": "PG",
+            "type": 3,
+            "release_date": "2020-01-02T00:00:00.000Z"
+          },
+          {
+            "certification": "PG",
+            "type": 4,
+            "release_date": "2020-02-01T00:00:00.000Z"
+          },
+          {
+            "certification": "PG",
+            "type": 5,
+            "release_date": "2020-03-01T00:00:00.000Z"
+          }
+        ]
+      }
+    ]
+  },
+  "alternative_titles": {
+    "titles": [
+      {
+        "iso_3166_1": "US",
+        "title": "Synthetic Alternate",
+        "type": "",
+        "iso_639_1": "en"
+      }
+    ]
+  },
+  "translations": {
+    "translations": [
+      {
+        "iso_3166_1": "US",
+        "iso_639_1": "en",
+        "name": "English",
+        "english_name": "English",
+        "data": {
+          "title": "Synthetic Feature",
+          "overview": "Synthetic overview."
+        }
+      }
+    ]
+  },
+  "recommendations": {
+    "page": 1,
+    "total_pages": 1,
+    "results": [
+      { "id": 2, "title": "Synthetic Recommendation" }
+    ]
+  },
+  "videos": {
+    "results": [
+      { "key": "syntheticTrailer", "site": "YouTube", "type": "Trailer" }
+    ]
+  },
+  "keywords": {
+    "keywords": [
+      { "name": "synthetic" }
+    ]
+  }
+}

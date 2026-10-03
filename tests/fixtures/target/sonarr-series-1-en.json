@@ -1,0 +1,78 @@
+{
+  "tvdbId": 1,
+  "title": "Synthetic Show",
+  "overview": "Synthetic show overview.",
+  "slug": "synthetic-show",
+  "originalCountry": "usa",
+  "originalLanguage": "eng",
+  "language": "eng",
+  "firstAired": "2020-01-02",
+  "lastAired": "2020-01-09",
+  "tvRageId": null,
+  "tvMazeId": 100,
+  "tmdbId": 200,
+  "imdbId": "tt0000002",
+  "malIds": [],
+  "anidbIds": [],
+  "aniListIds": [],
+  "lastUpdated": "2026-01-01T00:00:00Z",
+  "status": "Continuing",
+  "runtime": 30,
+  "originalNetwork": "Synthetic Network",
+  "network": "Synthetic Network",
+  "genres": ["Drama", "Mystery"],
+  "contentRating": "TV-14",
+  "rating": { "count": 100, "value": "7.0" },
+  "alternativeTitles": [
+    { "title": "Synthetic Alias" }
+  ],
+  "actors": [
+    {
+      "name": "Synthetic Actor",
+      "character": "Synthetic Character",
+      "image": "https://example.com/synth-actor.jpg"
+    }
+  ],
+  "images": [
+    { "coverType": "Poster", "url": "https://example.com/synth-series-poster.jpg" },
+    { "coverType": "Fanart", "url": "https://example.com/synth-series-fanart.jpg" }
+  ],
+  "seasons": [
+    {
+      "seasonNumber": 1,
+      "images": [
+        { "coverType": "Poster", "url": "https://example.com/synth-season-1.jpg" }
+      ]
+    }
+  ],
+  "episodes": [
+    {
+      "tvdbShowId": 1,
+      "tvdbId": 101,
+      "seasonNumber": 1,
+      "episodeNumber": 1,
+      "absoluteEpisodeNumber": 1,
+      "title": "Synthetic Episode One",
+      "airDate": "2020-01-02",
+      "airDateUtc": "2020-01-02T00:00:00Z",
+      "runtime": 30,
+      "overview": "First synthetic episode.",
+      "image": "https://example.com/synth-episode-1.jpg",
+      "rating": { "count": 5, "value": "8.0" }
+    },
+    {
+      "tvdbShowId": 1,
+      "tvdbId": 102,
+      "seasonNumber": 1,
+      "episodeNumber": 2,
+      "absoluteEpisodeNumber": 2,
+      "title": "Synthetic Episode Two",
+      "airDate": "2020-01-09",
+      "airDateUtc": "2020-01-09T00:00:00Z",
+      "runtime": 30,
+      "overview": "Second synthetic episode.",
+      "image": "https://example.com/synth-episode-2.jpg",
+      "finaleType": "season"
+    }
+  ]
+}

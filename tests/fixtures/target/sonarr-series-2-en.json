@@ -1,0 +1,68 @@
+{
+  "tvdbId": 2,
+  "title": "Synthetic Anthology",
+  "overview": "Synthetic anthology overview.",
+  "slug": "synthetic-anthology",
+  "originalCountry": "usa",
+  "originalLanguage": "eng",
+  "language": "eng",
+  "firstAired": "2021-03-01",
+  "lastAired": "2021-03-08",
+  "tvRageId": null,
+  "tvMazeId": null,
+  "tmdbId": 202,
+  "imdbId": "tt0000003",
+  "malIds": [],
+  "anidbIds": [],
+  "aniListIds": [],
+  "lastUpdated": "2026-01-01T00:00:00Z",
+  "status": "Ended",
+  "runtime": 45,
+  "originalNetwork": "Synthetic Anthology Network",
+  "network": "Synthetic Anthology Network",
+  "genres": ["Anthology"],
+  "contentRating": "TV-MA",
+  "rating": { "count": 50, "value": "6.0" },
+  "alternativeTitles": [],
+  "actors": [],
+  "images": [
+    { "coverType": "Poster", "url": "https://example.com/synth2-series-poster.jpg" }
+  ],
+  "seasons": [
+    {
+      "seasonNumber": 1,
+      "images": [
+        { "coverType": "Poster", "url": "https://example.com/synth2-season-1-aired.jpg" }
+      ]
+    }
+  ],
+  "episodes": [
+    {
+      "tvdbShowId": 2,
+      "tvdbId": 201,
+      "seasonNumber": 1,
+      "episodeNumber": 1,
+      "absoluteEpisodeNumber": 1,
+      "title": "Synthetic Anthology Episode One",
+      "airDate": "2021-03-01",
+      "airDateUtc": "2021-03-01T00:00:00Z",
+      "runtime": 45,
+      "overview": "First synthetic anthology episode.",
+      "image": "https://example.com/synth2-episode-1.jpg"
+    },
+    {
+      "tvdbShowId": 2,
+      "tvdbId": 202,
+      "seasonNumber": 1,
+      "episodeNumber": 2,
+      "absoluteEpisodeNumber": 2,
+      "title": "Synthetic Anthology Episode Two",
+      "airDate": "2021-03-08",
+      "airDateUtc": "2021-03-08T00:00:00Z",
+      "runtime": 45,
+      "overview": "Second synthetic anthology episode.",
+      "image": "https://example.com/synth2-episode-2.jpg",
+      "finaleType": "season"
+    }
+  ]
+}

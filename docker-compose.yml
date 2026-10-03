@@ -1,0 +1,54 @@
+# Providarr + external Postgres (recommended).
+#
+#   cp .env.example .env    # fill in TMDB_API_TOKEN / TVDB_API_KEY
+#   docker compose up -d --build
+#
+# Secrets are read from `.env` (gitignored). The DATABASE_URL in `.env` is
+# overridden below to point at the `postgres` service.
+name: providarr
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: providarr
+      POSTGRES_PASSWORD: providarr
+      POSTGRES_DB: providarr
+    volumes:
+      - providarr-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U providarr -d providarr"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  providarr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: magicbotalex2/providarr:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever DATABASE_URL is in .env so it targets the service.
+      DATABASE_URL: postgres://providarr:providarr@postgres:5432/providarr
+      PROVIDARR_CONFIG: /app/config/config.json
+    ports:
+      - "4155:4155"
+    volumes:
+      - providarr-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4155/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  providarr-postgres:
+  providarr-logs:

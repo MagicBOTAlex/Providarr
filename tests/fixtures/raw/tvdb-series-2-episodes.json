@@ -1,0 +1,51 @@
+{
+  "status": "success",
+  "data": {
+    "series": {
+      "id": 2,
+      "name": "Synthetic Anthology",
+      "slug": "synthetic-anthology"
+    },
+    "episodes": [
+      {
+        "id": 201,
+        "seriesId": 2,
+        "name": "Synthetic Anthology Episode One",
+        "aired": "2021-03-01",
+        "runtime": 45,
+        "overview": "First synthetic anthology episode.",
+        "image": "https://example.com/synth2-episode-1.jpg",
+        "imageType": 11,
+        "isMovie": 0,
+        "number": 1,
+        "absoluteNumber": 1,
+        "seasonNumber": 1,
+        "finaleType": null,
+        "year": "2021"
+      },
+      {
+        "id": 202,
+        "seriesId": 2,
+        "name": "Synthetic Anthology Episode Two",
+        "aired": "2021-03-08",
+        "runtime": 45,
+        "overview": "Second synthetic anthology episode.",
+        "image": "https://example.com/synth2-episode-2.jpg",
+        "imageType": 11,
+        "isMovie": 0,
+        "number": 2,
+        "absoluteNumber": 2,
+        "seasonNumber": 1,
+        "finaleType": "season",
+        "year": "2021"
+      }
+    ]
+  },
+  "links": {
+    "prev": null,
+    "self": "https://example.invalid/series/2/episodes/default?page=0",
+    "next": null,
+    "total_items": 2,
+    "page_size": 500
+  }
+}

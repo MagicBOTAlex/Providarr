@@ -1,0 +1,74 @@
+{
+  "TmdbId": 1,
+  "ImdbId": "tt0000001",
+  "Title": "Synthetic Feature",
+  "Overview": "Synthetic overview.",
+  "OriginalTitle": "Synthetic Original",
+  "OriginalLanguage": "en",
+  "TitleSlug": "1",
+  "Runtime": 120,
+  "Popularity": 1.5,
+  "Year": 2020,
+  "Premier": null,
+  "InCinema": "2020-01-02T00:00:00Z",
+  "PhysicalRelease": "2020-03-01T00:00:00Z",
+  "DigitalRelease": "2020-02-01T00:00:00Z",
+  "Images": [
+    { "CoverType": "Poster", "Url": "https://example.com/synthetic-poster.jpg" },
+    { "CoverType": "Fanart", "Url": "https://example.com/synthetic-backdrop.jpg" }
+  ],
+  "Ratings": [
+    { "Count": 10, "Value": 7.5, "Origin": "Tmdb", "Type": "User" }
+  ],
+  "MovieRatings": {
+    "Tmdb": { "Count": 10, "Value": 7.5, "Type": "User" },
+    "Imdb": null,
+    "Metacritic": null,
+    "RottenTomatoes": null,
+    "Trakt": null
+  },
+  "Genres": ["Drama", "Comedy"],
+  "Keywords": ["synthetic"],
+  "AlternativeTitles": [
+    { "Title": "Synthetic Alternate", "Type": "", "Language": "en" }
+  ],
+  "Translations": [
+    { "Title": "Synthetic Feature", "Overview": "Synthetic overview.", "Language": "en" }
+  ],
+  "Recommendations": [
+    { "TmdbId": 2, "Title": "Synthetic Recommendation" }
+  ],
+  "Credits": {
+    "Cast": [
+      {
+        "Name": "Synthetic Actor",
+        "Order": 0,
+        "Character": "Synthetic Character",
+        "TmdbId": 1,
+        "CreditId": "synthetic-credit-1",
+        "Images": [
+          { "CoverType": "Headshot", "Url": "https://example.com/synthetic-actor.jpg" }
+        ]
+      }
+    ],
+    "Crew": [
+      {
+        "Name": "Synthetic Director",
+        "Order": 0,
+        "Job": "Director",
+        "Department": "Directing",
+        "TmdbId": 2,
+        "CreditId": "synthetic-credit-2",
+        "Images": []
+      }
+    ]
+  },
+  "Studio": "Synthetic Studios",
+  "YoutubeTrailerId": "syntheticTrailer",
+  "Certifications": [
+    { "Country": "US", "Certification": "PG" }
+  ],
+  "Status": "Released",
+  "Collection": null,
+  "Homepage": "https://example.com/synthetic-feature"
+}

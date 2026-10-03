@@ -1,0 +1,53 @@
+{
+  "upstream": [
+    {
+      "provider": "tmdb",
+      "method": "GET",
+      "path": "/movie/1",
+      "file": "raw/tmdb-movie-1.json",
+      "content_type": "application/json",
+      "status": 200
+    },
+    {
+      "provider": "tvdb",
+      "method": "GET",
+      "path": "/series/1/extended",
+      "file": "raw/tvdb-series-1-extended.json",
+      "content_type": "application/json",
+      "status": 200
+    },
+    {
+      "provider": "tvdb",
+      "method": "GET",
+      "path": "/series/1/episodes/default",
+      "file": "raw/tvdb-series-1-episodes.json",
+      "content_type": "application/json",
+      "status": 200
+    },
+    {
+      "provider": "tvdb",
+      "method": "GET",
+      "path": "/series/2/extended",
+      "file": "raw/tvdb-series-2-extended.json",
+      "content_type": "application/json",
+      "status": 200
+    },
+    {
+      "provider": "tvdb",
+      "method": "GET",
+      "path": "/series/2/episodes/default",
+      "file": "raw/tvdb-series-2-episodes.json",
+      "content_type": "application/json",
+      "status": 200
+    }
+  ],
+  "metadata": {
+    "movie": [
+      { "id": "1", "file": "target/radarr-movie-1.json" }
+    ],
+    "series": [
+      { "id": "1", "file": "target/sonarr-series-1-en.json" },
+      { "id": "2", "file": "target/sonarr-series-2-en.json" }
+    ]
+  }
+}

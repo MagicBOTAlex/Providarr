@@ -1,0 +1,108 @@
+{
+  "status": "success",
+  "data": {
+    "id": 1,
+    "name": "Synthetic Show",
+    "slug": "synthetic-show",
+    "image": "https://example.com/synth-series-poster.jpg",
+    "aliases": [
+      { "language": "eng", "name": "Synthetic Alias" }
+    ],
+    "firstAired": "2020-01-02",
+    "lastAired": "2020-01-09",
+    "score": 7.0,
+    "status": { "id": 1, "name": "Continuing", "recordType": "series", "keepUpdated": true },
+    "originalCountry": "usa",
+    "originalLanguage": "eng",
+    "averageRuntime": 30,
+    "overview": "Synthetic show overview.",
+    "year": "2020",
+    "artworks": [
+      {
+        "id": 1,
+        "image": "https://example.com/synth-series-poster.jpg",
+        "thumbnail": "https://example.com/synth-series-poster_t.jpg",
+        "language": "eng",
+        "type": 2,
+        "score": 5,
+        "width": 680,
+        "height": 1000
+      },
+      {
+        "id": 2,
+        "image": "https://example.com/synth-series-fanart.jpg",
+        "thumbnail": "https://example.com/synth-series-fanart_t.jpg",
+        "language": "eng",
+        "type": 3,
+        "score": 5,
+        "width": 1920,
+        "height": 1080
+      },
+      {
+        "id": 3,
+        "image": "https://example.com/synth-series-banner.jpg",
+        "thumbnail": "https://example.com/synth-series-banner_t.jpg",
+        "language": "eng",
+        "type": 1,
+        "score": 4,
+        "width": 758,
+        "height": 140
+      }
+    ],
+    "latestNetwork": { "id": 1, "name": "Synthetic Network", "slug": "synthetic-network" },
+    "genres": [
+      { "id": 1, "name": "Drama", "slug": "drama" },
+      { "id": 2, "name": "Mystery", "slug": "mystery" }
+    ],
+    "remoteIds": [
+      { "id": "tt0000002", "type": 2, "sourceName": "IMDB" },
+      { "id": "200", "type": 12, "sourceName": "TheMovieDB.com" },
+      { "id": "100", "type": 1, "sourceName": "TV Maze" }
+    ],
+    "characters": [
+      {
+        "id": 1,
+        "name": "Synthetic Character",
+        "peopleId": 1,
+        "seriesId": 1,
+        "type": 3,
+        "sort": 0,
+        "isFeatured": true,
+        "peopleType": "Actor",
+        "personName": "Synthetic Actor",
+        "personImgURL": "https://example.com/synth-actor.jpg"
+      }
+    ],
+    "airsDays": {
+      "sunday": false,
+      "monday": true,
+      "tuesday": false,
+      "wednesday": false,
+      "thursday": false,
+      "friday": false,
+      "saturday": false
+    },
+    "airsTime": "20:00",
+    "seasons": [
+      {
+        "id": 1,
+        "seriesId": 1,
+        "type": { "id": 1, "name": "Aired Order", "type": "official", "alternateName": null },
+        "number": 1,
+        "image": "https://example.com/synth-season-1.jpg",
+        "imageType": 7
+      }
+    ],
+    "contentRatings": [
+      {
+        "id": 1,
+        "name": "TV-14",
+        "country": "usa",
+        "description": "Parents strongly cautioned",
+        "contentType": "",
+        "order": 0,
+        "fullname": null
+      }
+    ]
+  }
+}

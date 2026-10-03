@@ -1,0 +1,38 @@
+# Providarr with an embedded Postgres 16 in the same container (all-in-one).
+#
+#   cp .env.example .env    # fill in TMDB_API_TOKEN / TVDB_API_KEY
+#   docker compose -f docker-compose.embedded.yml up -d --build
+#
+# Postgres data lives in the `providarr-embedded-postgres` volume.
+name: providarr-embedded
+
+services:
+  providarr:
+    build:
+      context: .
+      dockerfile: Dockerfile.embedded
+    image: magicbotalex2/providarr:embedded
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://providarr:providarr@127.0.0.1:5432/providarr
+      POSTGRES_USER: providarr
+      POSTGRES_PASSWORD: providarr
+      POSTGRES_DB: providarr
+      PROVIDARR_CONFIG: /app/config/config.json
+    ports:
+      - "4155:4155"
+    volumes:
+      - providarr-embedded-postgres:/var/lib/postgresql/data
+      - providarr-embedded-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4155/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+volumes:
+  providarr-embedded-postgres:
+  providarr-embedded-logs:

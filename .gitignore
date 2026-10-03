@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.env
+*.log
+/logs
+
+# Nix
+/result
+/result-*
+.direnv/
+
+# Local replay recordings (replay.record writes under replay.dir)
+/fixtures/

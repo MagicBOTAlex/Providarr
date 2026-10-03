@@ -1,0 +1,79 @@
+{
+  "status": "success",
+  "data": {
+    "id": 2,
+    "name": "Synthetic Anthology",
+    "slug": "synthetic-anthology",
+    "image": "https://example.com/synth2-series-poster.jpg",
+    "aliases": [],
+    "firstAired": "2021-03-01",
+    "lastAired": "2021-03-08",
+    "score": 6.0,
+    "status": { "id": 2, "name": "Ended", "recordType": "series", "keepUpdated": false },
+    "originalCountry": "usa",
+    "originalLanguage": "eng",
+    "averageRuntime": 45,
+    "overview": "Synthetic anthology overview.",
+    "year": "2021",
+    "artworks": [
+      {
+        "id": 10,
+        "image": "https://example.com/synth2-series-poster.jpg",
+        "thumbnail": "https://example.com/synth2-series-poster_t.jpg",
+        "language": "eng",
+        "type": 2,
+        "score": 5,
+        "width": 680,
+        "height": 1000
+      }
+    ],
+    "latestNetwork": { "id": 2, "name": "Synthetic Anthology Network", "slug": "synthetic-anthology-network" },
+    "genres": [
+      { "id": 3, "name": "Anthology", "slug": "anthology" }
+    ],
+    "remoteIds": [
+      { "id": "tt0000003", "type": 2, "sourceName": "IMDB" },
+      { "id": "202", "type": 12, "sourceName": "TheMovieDB.com" }
+    ],
+    "characters": [],
+    "airsDays": {
+      "sunday": false,
+      "monday": true,
+      "tuesday": false,
+      "wednesday": false,
+      "thursday": false,
+      "friday": false,
+      "saturday": false
+    },
+    "airsTime": null,
+    "seasons": [
+      {
+        "id": 20,
+        "seriesId": 2,
+        "type": { "id": 2, "name": "DVD Order", "type": "dvd", "alternateName": null },
+        "number": 1,
+        "image": "https://example.com/synth2-season-1-dvd.jpg",
+        "imageType": 7
+      },
+      {
+        "id": 21,
+        "seriesId": 2,
+        "type": { "id": 1, "name": "Aired Order", "type": "official", "alternateName": null },
+        "number": 1,
+        "image": "https://example.com/synth2-season-1-aired.jpg",
+        "imageType": 7
+      }
+    ],
+    "contentRatings": [
+      {
+        "id": 2,
+        "name": "TV-MA",
+        "country": "usa",
+        "description": "Not suitable for children",
+        "contentType": "",
+        "order": 0,
+        "fullname": null
+      }
+    ]
+  }
+}

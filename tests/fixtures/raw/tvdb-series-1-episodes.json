@@ -1,0 +1,51 @@
+{
+  "status": "success",
+  "data": {
+    "series": {
+      "id": 1,
+      "name": "Synthetic Show",
+      "slug": "synthetic-show"
+    },
+    "episodes": [
+      {
+        "id": 101,
+        "seriesId": 1,
+        "name": "Synthetic Episode One",
+        "aired": "2020-01-02",
+        "runtime": 30,
+        "overview": "First synthetic episode.",
+        "image": "https://example.com/synth-episode-1.jpg",
+        "imageType": 11,
+        "isMovie": 0,
+        "number": 1,
+        "absoluteNumber": 1,
+        "seasonNumber": 1,
+        "finaleType": null,
+        "year": "2020"
+      },
+      {
+        "id": 102,
+        "seriesId": 1,
+        "name": "Synthetic Episode Two",
+        "aired": "2020-01-09",
+        "runtime": 30,
+        "overview": "Second synthetic episode.",
+        "image": "https://example.com/synth-episode-2.jpg",
+        "imageType": 11,
+        "isMovie": 0,
+        "number": 2,
+        "absoluteNumber": 2,
+        "seasonNumber": 1,
+        "finaleType": "season",
+        "year": "2020"
+      }
+    ]
+  },
+  "links": {
+    "prev": null,
+    "self": "https://example.invalid/series/1/episodes/default?page=0",
+    "next": null,
+    "total_items": 2,
+    "page_size": 500
+  }
+}
