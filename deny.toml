@@ -1,0 +1,37 @@
+# cargo-deny configuration for Providarr.
+#
+# Run locally with: cargo deny check
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+# Fail the build when a dependency has been yanked from its registry.
+yanked = "deny"
+# Vulnerabilities are always denied; only silence a specific, understood
+# advisory here. Extend this list (with a comment/expiry) as needed, e.g.:
+#   ignore = ["RUSTSEC-0000-0000"]
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Permissive licenses accepted for this project's dependency graph.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
