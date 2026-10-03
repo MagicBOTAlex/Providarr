@@ -1,7 +1,12 @@
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -20,8 +25,13 @@ use crate::config::InboundLimiterConfig;
 pub const DEFAULT_V6_PREFIX_LEN: u8 = 64;
 
 /// Hard ceiling on the number of tracked per-IP buckets. Once reached, stale
-/// buckets are evicted; if the map is still full the keyed state is reset.
+/// buckets are evicted; if the state is still full, only a fraction of the
+/// sharded keyed state is reset so existing budgets are preserved.
 pub const DEFAULT_MAX_TRACKED_IPS: usize = 100_000;
+
+/// The keyed limiter is sharded so eviction resets at most one shard (a
+/// fraction of tracked budgets) instead of clearing every client's state.
+const LIMITER_SHARDS: usize = 16;
 
 pub const TRUSTED_PROXIES_ENV: &str = "PROVIDARR_INBOUND_TRUSTED_PROXIES";
 pub const V6_PREFIX_ENV: &str = "PROVIDARR_INBOUND_V6_PREFIX_LEN";
@@ -65,10 +75,20 @@ impl IpRule {
 
         if let Ok(v6) = addr.parse::<Ipv6Addr>() {
             // Collapse `::ffff:a.b.c.d/N` to IPv4. The mapped prefix occupies the
-            // top 96 bits, so the IPv4 prefix is `N - 96` (0 when N < 96).
+            // top 96 bits, so the IPv4 prefix is `N - 96`. A prefix below 96 (or
+            // above 128) cannot be expressed as an IPv4 prefix and would otherwise
+            // underflow to a catch-all `0.0.0.0/0`, so reject it.
             if let Some(mapped) = v6.to_ipv4_mapped() {
-                let prefix = prefix.unwrap_or(128).min(128);
-                let v4_prefix = prefix.saturating_sub(96);
+                let prefix = prefix.unwrap_or(128);
+                if !(96..=128).contains(&prefix) {
+                    tracing::warn!(
+                        rule = %addr,
+                        prefix,
+                        "ignoring IPv4-mapped IPv6 rule with out-of-range prefix"
+                    );
+                    return None;
+                }
+                let v4_prefix = prefix - 96;
                 let bits = u32::from(mapped);
                 return Some(IpRule::V4 {
                     net: bits & mask_v4(v4_prefix),
@@ -131,11 +151,70 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Parses a single token from an `X-Forwarded-For` chain. Accepts a bare IP, an
+/// `ip:port` pair, a bracketed IPv6 address (`[::1]` / `[::1]:443`), and an IPv6
+/// zone suffix (`fe80::1%eth0`). Returns `None` for anything unparseable.
+fn parse_forwarded_hop(raw: &str) -> Option<IpAddr> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Bracketed IPv6, optionally followed by a port: `[::1]` or `[::1]:443`.
+    if let Some(rest) = raw.strip_prefix('[') {
+        let (addr, _port) = rest.split_once(']')?;
+        return parse_ip_without_zone(addr.trim());
+    }
+
+    if let Some(ip) = parse_ip_without_zone(raw) {
+        return Some(ip);
+    }
+
+    // `ip:port`. IPv6 addresses must be bracketed, so an unbracketed value with a
+    // single trailing `:port` is an IPv4 address.
+    match raw.rsplit_once(':') {
+        Some((addr, port)) if port.parse::<u16>().is_ok() => parse_ip_without_zone(addr.trim()),
+        _ => None,
+    }
+}
+
+/// Strips an optional `%zone` suffix and parses the remaining address.
+fn parse_ip_without_zone(raw: &str) -> Option<IpAddr> {
+    let addr = raw.split('%').next().unwrap_or(raw).trim();
+    addr.parse::<IpAddr>().ok()
+}
+
+/// Parses a whole `X-Forwarded-For` value. Returns `None` if any non-empty hop
+/// fails to parse, so the caller can fail closed rather than silently dropping
+/// individual hops and promoting an attacker-supplied value to the client.
+fn parse_forwarded_chain(raw: &str) -> Option<Vec<IpAddr>> {
+    let mut chain = Vec::new();
+    for hop in raw.split(',') {
+        let hop = hop.trim();
+        if hop.is_empty() {
+            continue;
+        }
+        chain.push(normalize_ip(parse_forwarded_hop(hop)?));
+    }
+    Some(chain)
+}
+
 /// Parses configured IP rules, warning about (and dropping) entries that are not
 /// valid addresses or CIDRs instead of silently ignoring them.
 fn parse_rules(raw: &[String], kind: &str) -> Vec<IpRule> {
     raw.iter()
         .filter_map(|entry| match IpRule::parse(entry) {
+            // A `/0` rule matches every address. In the bypass list that disables
+            // limiting entirely; in the trusted-proxy list it makes every peer a
+            // trusted proxy. Drop it so a single typo cannot open the door.
+            Some(IpRule::V4 { prefix: 0, .. } | IpRule::V6 { prefix: 0, .. }) => {
+                tracing::warn!(
+                    entry = %entry,
+                    kind,
+                    "ignoring catch-all inbound IP rule (/0 would disable limiting)"
+                );
+                None
+            }
             Some(rule) => Some(rule),
             None => {
                 tracing::warn!(entry = %entry, kind, "ignoring invalid inbound IP rule");
@@ -186,7 +265,8 @@ pub struct InboundLimiter {
     v6_prefix_len: u8,
     max_tracked_ips: usize,
     quota: Quota,
-    limiter: RwLock<DefaultKeyedRateLimiter<IpAddr>>,
+    limiters: Vec<RwLock<DefaultKeyedRateLimiter<IpAddr>>>,
+    evict_cursor: AtomicUsize,
     global: Option<DefaultDirectRateLimiter>,
     concurrency: Option<Arc<Semaphore>>,
 }
@@ -215,6 +295,9 @@ impl InboundLimiter {
             .then(|| Arc::new(Semaphore::new(config.max_concurrent as usize)));
 
         let quota = quota_for(config.requests_per_second, config.burst);
+        let limiters = (0..LIMITER_SHARDS)
+            .map(|_| RwLock::new(RateLimiter::keyed(quota)))
+            .collect();
 
         if config.trust_forwarded_for && trusted_proxies.is_empty() {
             tracing::warn!(
@@ -232,7 +315,8 @@ impl InboundLimiter {
             v6_prefix_len: env_v6_prefix_len(),
             max_tracked_ips: env_max_tracked_ips(),
             quota,
-            limiter: RwLock::new(RateLimiter::keyed(quota)),
+            limiters,
+            evict_cursor: AtomicUsize::new(0),
             global,
             concurrency,
         }
@@ -256,7 +340,15 @@ impl InboundLimiter {
 
     /// Number of per-IP buckets currently tracked.
     pub fn tracked_keys(&self) -> usize {
-        self.limiter.read().len()
+        self.limiters.iter().map(|shard| shard.read().len()).sum()
+    }
+
+    /// Selects the shard that owns `key`, so a given client always maps to one
+    /// keyed limiter and eviction only ever touches a fraction of the state.
+    fn shard_for(&self, key: &IpAddr) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.limiters.len()
     }
 
     /// True when the address matches a configured bypass IP/CIDR.
@@ -287,21 +379,26 @@ impl InboundLimiter {
         }
 
         if let Some(raw) = forwarded_for {
-            let mut chain: Vec<IpAddr> = raw
-                .split(',')
-                .filter_map(|hop| hop.trim().parse::<IpAddr>().ok())
-                .map(normalize_ip)
-                .collect();
-
-            if !chain.is_empty() {
-                chain.push(peer);
+            match parse_forwarded_chain(raw) {
                 // Walk from the trusted edge inward: the first hop we do not trust
                 // is the closest thing to the real client.
-                if let Some(client) = chain.iter().rev().find(|hop| !self.is_trusted_proxy(**hop)) {
-                    return *client;
+                Some(chain) if !chain.is_empty() => {
+                    return match chain.iter().rev().find(|hop| !self.is_trusted_proxy(**hop)) {
+                        Some(client) => *client,
+                        // Every hop (and the peer) is a trusted proxy. Never fall
+                        // back to the attacker-controlled leftmost hop; use the
+                        // immediate TCP peer instead.
+                        None => peer,
+                    };
                 }
-                if let Some(first) = chain.first() {
-                    return *first;
+                // An empty header carries no information; fall through to
+                // X-Real-IP.
+                Some(_) => {}
+                // Any unparseable hop invalidates the whole chain: silently
+                // dropping it could promote a spoofed left value to the client.
+                None => {
+                    tracing::warn!("ignoring malformed X-Forwarded-For header; using TCP peer");
+                    return peer;
                 }
             }
         }
@@ -335,10 +432,11 @@ impl InboundLimiter {
             return Ok(());
         }
 
-        self.evict_if_needed();
-
         let key = self.key_for(ip);
-        self.limiter
+        let shard = self.shard_for(&key);
+        self.evict_if_needed(shard);
+
+        self.limiters[shard]
             .read()
             .check_key(&key)
             .map(|_| ())
@@ -373,24 +471,46 @@ impl InboundLimiter {
     /// Drops per-IP limiter state for addresses not seen recently, bounding memory
     /// when the endpoint is exposed to a large, changing set of client IPs.
     pub fn retain_recent(&self) {
-        self.limiter.read().retain_recent();
+        for shard in &self.limiters {
+            shard.read().retain_recent();
+        }
     }
 
-    /// Keeps the keyed state bounded: when the tracked-key count reaches the cap,
-    /// evict stale buckets first and reset the map if it is still full.
-    fn evict_if_needed(&self) {
-        if self.limiter.read().len() < self.max_tracked_ips {
+    /// Keeps the keyed state bounded. When the tracked-key count reaches the cap,
+    /// stale buckets are dropped first; if the state is still full, only a subset
+    /// of shards is reset, so a burst of new clients cannot clear every existing
+    /// client's budget at once.
+    fn evict_if_needed(&self, protected_shard: usize) {
+        if self.tracked_keys() < self.max_tracked_ips {
             return;
         }
 
-        let mut limiter = self.limiter.write();
-        limiter.retain_recent();
-        if limiter.len() >= self.max_tracked_ips {
+        for shard in &self.limiters {
+            shard.read().retain_recent();
+        }
+
+        let shards = self.limiters.len();
+        let mut reset = 0;
+        while self.tracked_keys() >= self.max_tracked_ips && reset < shards {
+            // Rotate through the shards, avoiding the caller's own shard first so
+            // a client cannot trigger an eviction that refreshes its own budget.
+            let mut victim = self.evict_cursor.fetch_add(1, Ordering::Relaxed) % shards;
+            if victim == protected_shard {
+                victim = (victim + 1) % shards;
+            }
+
+            let mut shard = self.limiters[victim].write();
+            if shard.is_empty() {
+                reset += 1;
+                continue;
+            }
             tracing::warn!(
                 max_tracked_ips = self.max_tracked_ips,
-                "inbound per-IP state reached its bound; resetting tracked keys"
+                shard = victim,
+                "inbound per-IP state reached its bound; evicting one shard of tracked keys"
             );
-            *limiter = RateLimiter::keyed(self.quota);
+            *shard = RateLimiter::keyed(self.quota);
+            reset += 1;
         }
     }
 }
@@ -551,6 +671,102 @@ mod tests {
             Some("5.6.7.8"),
         );
         assert_eq!(spoofed, "203.0.113.5".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn malformed_forwarded_chain_fails_closed_to_peer() {
+        let mut limiter = InboundLimiter::new(&config(1.0, 1));
+        limiter.trust_forwarded_for = true;
+        limiter.trusted_proxies = vec![IpRule::parse("10.0.0.0/8").unwrap()];
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // A spoofed leftmost value followed by an unparseable hop must not become
+        // the client key; the whole header is discarded in favour of the peer.
+        let client =
+            limiter.resolve_client_ip(peer, Some("203.0.113.9, not-an-ip"), Some("198.51.100.7"));
+        assert_eq!(client, peer);
+    }
+
+    #[test]
+    fn parses_forwarded_hops_with_ports_brackets_and_zones() {
+        let mut limiter = InboundLimiter::new(&config(1.0, 1));
+        limiter.trust_forwarded_for = true;
+        limiter.trusted_proxies = vec![IpRule::parse("10.0.0.0/8").unwrap()];
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+
+        assert_eq!(
+            limiter.resolve_client_ip(peer, Some("203.0.113.9:1234"), None),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            limiter.resolve_client_ip(peer, Some("[2001:db8::5]:443"), None),
+            "2001:db8::5".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            limiter.resolve_client_ip(peer, Some("fe80::1%eth0"), None),
+            "fe80::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            limiter.resolve_client_ip(peer, Some("[2001:db8::6]"), None),
+            "2001:db8::6".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn all_trusted_hops_fall_back_to_peer_not_leftmost() {
+        let mut limiter = InboundLimiter::new(&config(1.0, 1));
+        limiter.trust_forwarded_for = true;
+        limiter.trusted_proxies = vec![IpRule::parse("10.0.0.0/8").unwrap()];
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let client = limiter.resolve_client_ip(peer, Some("10.0.0.9, 10.0.0.8"), None);
+        assert_eq!(
+            client, peer,
+            "must not use the leftmost attacker-supplied hop"
+        );
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_cidr_underflow() {
+        // A prefix below 96 would underflow to a catch-all IPv4 rule.
+        assert!(IpRule::parse("::ffff:10.0.0.0/90").is_none());
+        assert!(IpRule::parse("::ffff:10.0.0.0/0").is_none());
+        // Above the valid IPv6 prefix length.
+        assert!(IpRule::parse("::ffff:10.0.0.0/129").is_none());
+    }
+
+    #[test]
+    fn rejects_catch_all_rules_for_all_lists() {
+        let rules = parse_rules(
+            &[
+                "0.0.0.0/0".to_string(),
+                "::/0".to_string(),
+                "10.0.0.0/8".to_string(),
+            ],
+            "test",
+        );
+        assert_eq!(rules.len(), 1, "catch-all rules are dropped");
+        assert!(rules[0].matches("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn eviction_resets_only_a_subset_of_shards() {
+        let mut limiter = InboundLimiter::new(&config(1.0, 1));
+        limiter.max_tracked_ips = 2;
+
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        limiter.limiters[0].write().check_key(&a).unwrap();
+        limiter.limiters[1].write().check_key(&b).unwrap();
+        assert_eq!(limiter.tracked_keys(), 2);
+
+        limiter.evict_if_needed(LIMITER_SHARDS - 1);
+
+        assert_eq!(
+            limiter.tracked_keys(),
+            1,
+            "only one shard is reset, so other budgets survive"
+        );
     }
 
     #[test]
