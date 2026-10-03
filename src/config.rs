@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, fmt, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,29 @@ const MAX_CACHE_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// Upper bound on `cache.max_body_bytes` (64 MiB).
 const MAX_CACHE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Upper bound on the `PROVIDARR_CONFIG` file so a misconfiguration cannot make
+/// startup read a huge (or endless) file into memory.
+const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Upper bound on `database.max_connections` so a hostile config cannot exhaust
+/// the database's connection slots.
+const MAX_DB_CONNECTIONS_CAP: u32 = 100;
+
+/// Headers that Providarr (or an intermediary) manages itself; reading the API
+/// key from any of them is unsafe because a client cannot reliably set them.
+const DENIED_AUTH_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "trailer",
+    "upgrade",
+    "te",
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+];
+
 /// Smallest non-zero requests/second value. Periods are the reciprocal, so
 /// anything smaller risks overflowing the rate-limiter's `Instant`.
 const MIN_REQUESTS_PER_SECOND: f64 = 1e-6;
@@ -40,6 +63,47 @@ const MIN_REQUESTS_PER_SECOND: f64 = 1e-6;
 /// `0.0` is allowed and means "disabled".
 fn invalid_requests_per_second(value: f64) -> bool {
     !value.is_finite() || value < 0.0 || (value > 0.0 && value < MIN_REQUESTS_PER_SECOND)
+}
+
+/// Rejects `server.host` values that would corrupt the `host:port` bind string.
+/// Hostnames, IPv4, and bracketed IPv6 (`[::1]`) are accepted.
+fn validate_server_host(host: &str) -> Result<(), AppError> {
+    if host.is_empty() {
+        return Err(AppError::Config("server.host must not be empty".into()));
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err(AppError::Config(
+            "server.host must not contain whitespace".into(),
+        ));
+    }
+    if host.contains('/') {
+        return Err(AppError::Config("server.host must not contain '/'".into()));
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err(AppError::Config(
+            "server.host must not contain ':' unless it is a bracketed IPv6 address".into(),
+        ));
+    }
+    if host.starts_with('[') != host.ends_with(']') {
+        return Err(AppError::Config(
+            "server.host has mismatched IPv6 brackets".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Masks the password in a database URL for safe logging. Unparseable URLs are
+/// wholly redacted rather than risking a secret in a log line.
+fn redact_database_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut url) => {
+            if url.password().is_some() {
+                let _ = url.set_password(Some("***"));
+            }
+            url.to_string()
+        }
+        Err(_) => "<redacted>".to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,13 +130,41 @@ impl AppConfig {
         let path =
             std::env::var("PROVIDARR_CONFIG").unwrap_or_else(|_| "config/config.json".to_string());
 
-        let mut config = if Path::new(&path).exists() {
-            let raw = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&raw)
-                .map_err(|e| AppError::Config(format!("failed to parse {path}: {e}")))?
-        } else {
-            tracing::warn!(path, "config file not found, using defaults");
-            AppConfig::default()
+        // `symlink_metadata` does not follow symlinks, so a symlinked config is
+        // rejected instead of silently resolved. A missing file keeps the
+        // default-fallback behaviour; anything else (directory, device, FIFO)
+        // is a hard error so startup cannot block on a special file.
+        let mut config = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(AppError::Config(format!(
+                    "config file {path:?} must not be a symlink"
+                )));
+            }
+            Ok(meta) if !meta.is_file() => {
+                return Err(AppError::Config(format!(
+                    "config file {path:?} is not a regular file"
+                )));
+            }
+            Ok(meta) if meta.len() > MAX_CONFIG_BYTES => {
+                return Err(AppError::Config(format!(
+                    "config file {path:?} is too large ({} bytes > {MAX_CONFIG_BYTES})",
+                    meta.len()
+                )));
+            }
+            Ok(_) => {
+                let raw = std::fs::read_to_string(&path)?;
+                serde_json::from_str(&raw)
+                    .map_err(|e| AppError::Config(format!("failed to parse {path}: {e}")))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(path, "config file not found, using defaults");
+                AppConfig::default()
+            }
+            Err(e) => {
+                return Err(AppError::Config(format!(
+                    "failed to inspect config file {path:?}: {e}"
+                )));
+            }
         };
 
         if let Ok(url) = std::env::var("DATABASE_URL") {
@@ -98,6 +190,25 @@ impl AppConfig {
                 "database.url uses the default providarr:providarr credentials; rotate them for any non-local deployment"
             );
         }
+        if self.database.max_connections == 0 {
+            return Err(AppError::Config(
+                "database.max_connections must be > 0".into(),
+            ));
+        }
+        if self.database.max_connections > MAX_DB_CONNECTIONS_CAP {
+            return Err(AppError::Config(format!(
+                "database.max_connections must be <= {MAX_DB_CONNECTIONS_CAP} (got {})",
+                self.database.max_connections
+            )));
+        }
+        if self.database.min_connections > self.database.max_connections {
+            return Err(AppError::Config(format!(
+                "database.min_connections ({}) must be <= database.max_connections ({})",
+                self.database.min_connections, self.database.max_connections
+            )));
+        }
+
+        validate_server_host(&self.server.host)?;
 
         if self.search.hydrate_limit > MAX_HYDRATE_LIMIT {
             return Err(AppError::Config(format!(
@@ -246,6 +357,19 @@ impl AppConfig {
                 "api_auth.enabled is true but api_auth.api_key is empty; set PROVIDARR_API_AUTH_KEY or disable api_auth"
                     .into(),
             ));
+        }
+        if self.api_auth.enabled || !self.api_auth.header.trim().is_empty() {
+            let header = self.api_auth.header.trim();
+            let name = http::HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+                AppError::Config(format!(
+                    "api_auth.header {header:?} is not a valid HTTP header name"
+                ))
+            })?;
+            if DENIED_AUTH_HEADERS.contains(&name.as_str()) {
+                return Err(AppError::Config(format!(
+                    "api_auth.header {header:?} is automatically managed or hop-by-hop and cannot carry the API key"
+                )));
+            }
         }
 
         Ok(())
@@ -425,7 +549,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
@@ -433,6 +557,10 @@ pub struct DatabaseConfig {
     pub min_connections: u32,
     #[serde(with = "humantime_serde")]
     pub acquire_timeout: Duration,
+    /// Require TLS for the database connection. When true the connection URL
+    /// must carry `sslmode=require` (it is appended if absent); when false a
+    /// non-loopback host without an explicit `sslmode` logs a warning.
+    pub require_tls: bool,
 }
 
 impl Default for DatabaseConfig {
@@ -442,7 +570,20 @@ impl Default for DatabaseConfig {
             max_connections: 10,
             min_connections: 1,
             acquire_timeout: Duration::from_secs(10),
+            require_tls: false,
         }
+    }
+}
+
+impl fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &redact_database_url(&self.url))
+            .field("max_connections", &self.max_connections)
+            .field("min_connections", &self.min_connections)
+            .field("acquire_timeout", &self.acquire_timeout)
+            .field("require_tls", &self.require_tls)
+            .finish()
     }
 }
 
@@ -728,7 +869,7 @@ impl Default for InboundLimiterConfig {
 }
 
 /// Optional shared-secret auth for Providarr's own HTTP API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiAuthConfig {
     pub enabled: bool,
@@ -745,6 +886,23 @@ impl Default for ApiAuthConfig {
             api_key: String::new(),
             header: "x-api-key".to_string(),
         }
+    }
+}
+
+impl fmt::Debug for ApiAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiAuthConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("header", &self.header)
+            .finish()
     }
 }
 
@@ -1000,5 +1158,118 @@ mod tests {
         assert_eq!(parse_rotation("minutely"), Some(LogRotation::Minutely));
         assert_eq!(parse_rotation("never"), Some(LogRotation::Never));
         assert_eq!(parse_rotation("weekly"), None);
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let db = DatabaseConfig {
+            url: "postgres://user:hunter2@db.example.com:5432/providarr".to_string(),
+            ..DatabaseConfig::default()
+        };
+        let rendered = format!("{db:?}");
+        assert!(!rendered.contains("hunter2"), "password leaked: {rendered}");
+        assert!(rendered.contains("***"), "password not masked: {rendered}");
+        assert!(rendered.contains("db.example.com"));
+
+        let auth = ApiAuthConfig {
+            enabled: true,
+            api_key: "supersecret".to_string(),
+            header: "x-api-key".to_string(),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("supersecret"), "key leaked: {rendered}");
+        assert!(rendered.contains("<redacted>"));
+
+        let empty = ApiAuthConfig {
+            api_key: String::new(),
+            ..ApiAuthConfig::default()
+        };
+        assert!(format!("{empty:?}").contains("<empty>"));
+    }
+
+    #[test]
+    fn app_config_debug_is_composed_and_redacted() {
+        let mut config = AppConfig::default();
+        config.api_auth.api_key = "topsecret".into();
+        config.database.url = "postgres://providarr:pw@elsewhere.example.com:5432/providarr".into();
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("topsecret"));
+        assert!(!rendered.contains("pw@elsewhere"));
+    }
+
+    #[test]
+    fn validation_rejects_bad_database_pool() {
+        let mut config = AppConfig::default();
+        config.database.max_connections = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.database.max_connections = MAX_DB_CONNECTIONS_CAP + 1;
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.database.min_connections = config.database.max_connections + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_bad_server_hosts() {
+        for host in ["", "0.0.0.0 ", "foo bar", "host/path", "host:4155", "[::1"] {
+            let mut config = AppConfig::default();
+            config.server.host = host.to_string();
+            assert!(
+                config.validate().is_err(),
+                "host {host:?} should be rejected"
+            );
+        }
+        for host in ["0.0.0.0", "localhost", "providarr.internal", "[::1]"] {
+            let mut config = AppConfig::default();
+            config.server.host = host.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "host {host:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_bad_or_dangerous_auth_headers() {
+        let mut config = AppConfig::default();
+        config.api_auth.enabled = true;
+        config.api_auth.api_key = "sekret".into();
+        config.api_auth.header = "not a header".into();
+        assert!(config.validate().is_err());
+
+        for header in [
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "x-forwarded-for",
+        ] {
+            let mut config = AppConfig::default();
+            config.api_auth.enabled = true;
+            config.api_auth.api_key = "sekret".into();
+            config.api_auth.header = header.into();
+            assert!(
+                config.validate().is_err(),
+                "header {header:?} should be rejected"
+            );
+        }
+
+        let mut config = AppConfig::default();
+        config.api_auth.enabled = true;
+        config.api_auth.api_key = "sekret".into();
+        config.api_auth.header = "x-api-key".into();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_require_tls_defaults_off_and_parses() {
+        assert!(!DatabaseConfig::default().require_tls);
+
+        let raw = r#"{"database": {"require_tls": true}}"#;
+        let config: AppConfig = serde_json::from_str(raw).unwrap();
+        assert!(config.database.require_tls);
     }
 }

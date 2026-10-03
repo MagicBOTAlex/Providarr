@@ -13,13 +13,57 @@ use crate::{config::DatabaseConfig, error::AppError, ratelimit::stats::EndpointS
 const STARTUP_ENDPOINT_STATS_LIMIT: i64 = 50_000;
 
 pub async fn connect(cfg: &DatabaseConfig) -> Result<PgPool, AppError> {
+    let url = resolve_connection_url(cfg)?;
     let pool = PgPoolOptions::new()
         .max_connections(cfg.max_connections)
         .min_connections(cfg.min_connections)
         .acquire_timeout(cfg.acquire_timeout)
-        .connect(&cfg.url)
+        .connect(&url)
         .await?;
     Ok(pool)
+}
+
+/// Applies the TLS policy from `DatabaseConfig` to the connection URL.
+///
+/// When `require_tls` is set, `sslmode=require` is appended unless the URL
+/// already specifies an `sslmode`/`ssl-mode`. Otherwise a non-loopback host
+/// without an explicit sslmode gets a warning recommending TLS.
+fn resolve_connection_url(cfg: &DatabaseConfig) -> Result<String, AppError> {
+    let has_sslmode = cfg.url.contains("sslmode=") || cfg.url.contains("ssl-mode=");
+    if cfg.require_tls {
+        if has_sslmode {
+            return Ok(cfg.url.clone());
+        }
+        let separator = if cfg.url.contains('?') { '&' } else { '?' };
+        let url = format!("{}{separator}sslmode=require", cfg.url);
+        tracing::info!(
+            "database.require_tls is enabled; appending sslmode=require to the connection URL"
+        );
+        return Ok(url);
+    }
+
+    if !has_sslmode
+        && let Some(host) = database_host(&cfg.url)
+        && !is_loopback_host(&host)
+    {
+        tracing::warn!(
+            host = %host,
+            "database.url does not set sslmode and the host is not loopback; set database.require_tls=true or add sslmode=require"
+        );
+    }
+    Ok(cfg.url.clone())
+}
+
+fn database_host(url: &str) -> Option<String> {
+    url::Url::parse(url).ok()?.host_str().map(str::to_string)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), AppError> {
@@ -272,4 +316,63 @@ pub async fn load_rate_limit_events(
             detail: row.get::<Option<String>, _>("detail"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_tls_appends_sslmode() {
+        let cfg = DatabaseConfig {
+            url: "postgres://user:pw@db.example.com:5432/providarr".into(),
+            require_tls: true,
+            ..DatabaseConfig::default()
+        };
+        let url = resolve_connection_url(&cfg).unwrap();
+        assert!(url.ends_with("sslmode=require"), "{url}");
+        assert!(url.contains("?sslmode=require"), "{url}");
+    }
+
+    #[test]
+    fn require_tls_respects_existing_sslmode() {
+        for raw in [
+            "postgres://user:pw@db.example.com:5432/providarr?sslmode=verify-full",
+            "postgres://user:pw@db.example.com:5432/providarr?ssl-mode=require",
+        ] {
+            let cfg = DatabaseConfig {
+                url: raw.into(),
+                require_tls: true,
+                ..DatabaseConfig::default()
+            };
+            assert_eq!(resolve_connection_url(&cfg).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn require_tls_appends_with_ampersand_when_query_present() {
+        let cfg = DatabaseConfig {
+            url: "postgres://user:pw@db.example.com:5432/providarr?application_name=providarr"
+                .into(),
+            require_tls: true,
+            ..DatabaseConfig::default()
+        };
+        let url = resolve_connection_url(&cfg).unwrap();
+        assert!(url.ends_with("&sslmode=require"), "{url}");
+    }
+
+    #[test]
+    fn plain_url_is_unchanged_without_require_tls() {
+        let cfg = DatabaseConfig::default();
+        assert_eq!(resolve_connection_url(&cfg).unwrap(), cfg.url);
+    }
+
+    #[test]
+    fn loopback_hosts_are_detected() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("db.example.com"));
+        assert!(!is_loopback_host("10.0.0.5"));
+    }
 }
