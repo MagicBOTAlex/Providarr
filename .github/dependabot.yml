@@ -7,7 +7,16 @@ updates:
       interval: weekly
     open-pull-requests-limit: 10
 
+  # Updates the SHA-pinned actions in .github/workflows, keeping the trailing
+  # version comment in sync.
   - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # Keeps the pinned Docker base-image digests in Dockerfile / Dockerfile.embedded
+  # current.
+  - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
