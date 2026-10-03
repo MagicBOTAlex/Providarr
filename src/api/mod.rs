@@ -30,6 +30,11 @@ use crate::{error::AppError, inbound::InboundLimiter, state::AppState};
 /// and could starve the (default 10-connection) pool.
 const HEALTH_CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// Hard upper bound on a single `/health` database probe. Without it a stalled
+/// database would hold [`HEALTH_CACHE`] for the whole request timeout, serializing
+/// every health check behind one probe.
+const DB_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Last observed database health as `(checked_at, healthy)`. The async mutex is
 /// held across the probe so a cache expiry under load triggers a single DB
 /// round-trip rather than a thundering herd.
@@ -141,7 +146,11 @@ async fn cached_db_health(state: &AppState) -> bool {
         return healthy;
     }
 
-    let healthy = crate::db::ping(&state.pool).await.is_ok();
+    // Bound the probe so a stalled database cannot hold the cache mutex (and
+    // therefore serialize every health check) for the full request timeout.
+    let healthy = tokio::time::timeout(DB_PROBE_TIMEOUT, crate::db::ping(&state.pool))
+        .await
+        .is_ok_and(|result| result.is_ok());
     *cache = Some((Instant::now(), healthy));
     healthy
 }
@@ -320,64 +329,88 @@ async fn proxy(
     };
 
     let upstream_content_type = response.content_type.as_deref();
-    let is_json = upstream_content_type.is_some_and(is_json_content_type);
-
-    let mut builder = Response::builder()
-        .status(StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY))
-        .header("x-providarr-cache", cache_state)
-        .header("x-providarr-provider", provider)
-        .header("x-content-type-options", "nosniff")
-        .header(
-            header::CONTENT_DISPOSITION,
-            if is_json { "inline" } else { "attachment" },
-        );
-
-    if response.replayed {
-        builder = builder.header("x-providarr-replay", "true");
-    }
 
     // Only forward content types on the allowlist. Anything else (notably
     // `text/html`, `application/xhtml+xml`, `image/svg+xml`) is coerced to JSON
     // so a misbehaving or compromised provider cannot get active content
     // rendered on this origin. `nosniff` backs this up.
     let content_type = match upstream_content_type {
-        Some(content_type) if is_safe_content_type(content_type) => content_type,
-        _ => "application/json",
+        Some(content_type) if is_safe_content_type(content_type) => content_type.to_string(),
+        _ => "application/json".to_string(),
     };
-    builder = builder.header(header::CONTENT_TYPE, content_type);
+
+    // Base `Content-Disposition` on the *final* forwarded type: an unsafe
+    // upstream type that was coerced to JSON above must be treated as JSON.
+    let disposition = if is_json_content_type(&content_type) {
+        "inline"
+    } else {
+        "attachment"
+    };
+
+    // The provider name is registry-vetted, but guard the header build anyway:
+    // an unrepresentable value becomes a 500 rather than a header-injection path.
+    let provider_header = axum::http::HeaderValue::from_str(&provider)
+        .map_err(|err| AppError::Internal(format!("invalid provider header: {err}")))?;
+
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY))
+        .header("x-providarr-cache", cache_state)
+        .header("x-providarr-provider", provider_header)
+        .header("x-content-type-options", "nosniff")
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, disposition);
+
+    if response.replayed {
+        builder = builder.header("x-providarr-replay", "true");
+    }
 
     builder
         .body(axum::body::Body::from(response.body))
         .map_err(|err| AppError::Internal(err.to_string()))
 }
 
+/// Reduces a `Content-Type` header to its bare media type: parameters are
+/// stripped and case is normalized. This is what stops `contains`-style checks
+/// from being tricked by a parameter such as `;foo="+json"`.
+fn base_media_type(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
 /// Content types that are safe to forward to clients verbatim. Everything else
 /// is coerced to `application/json` by [`proxy`].
 fn is_safe_content_type(content_type: &str) -> bool {
-    let value = content_type.trim().to_ascii_lowercase();
+    let base = base_media_type(content_type);
 
     // `image/svg+xml` is active content (it can carry scripts), so it is not
     // treated as a safe image despite the `image/` prefix.
-    if value.starts_with("image/svg") {
+    if base == "image/svg+xml" {
         return false;
     }
 
-    value.starts_with("application/json")
-        || starts_with_application_json_suffix(&value)
-        || value.starts_with("text/plain")
-        || value.starts_with("image/")
-        || value.starts_with("application/octet-stream")
+    base == "application/json"
+        || is_json_suffix_type(&base)
+        || base == "text/plain"
+        || base.starts_with("image/")
+        || base == "application/octet-stream"
 }
 
-/// True for the `application/<subtype>+json` structured-suffix family.
-fn starts_with_application_json_suffix(value: &str) -> bool {
-    value.starts_with("application/") && value.contains("+json")
+/// True for the `application/<subtype>+json` structured-suffix family. The
+/// subtype must *end* in `+json`; a parameter or trailing junk cannot satisfy it.
+fn is_json_suffix_type(base: &str) -> bool {
+    base.strip_prefix("application/")
+        .is_some_and(|subtype| subtype.ends_with("+json"))
 }
 
-/// True when a content type denotes JSON (used to decide `Content-Disposition`).
+/// True when a (bare or parameterized) content type denotes JSON, used to decide
+/// `Content-Disposition`.
 fn is_json_content_type(content_type: &str) -> bool {
-    let value = content_type.trim().to_ascii_lowercase();
-    value.starts_with("application/json") || starts_with_application_json_suffix(&value)
+    let base = base_media_type(content_type);
+    base == "application/json" || is_json_suffix_type(&base)
 }
 
 async fn radarr_movie(
@@ -549,6 +582,8 @@ fn json_bytes(body: Bytes) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-providarr-source", "fixture")
+        .header("x-content-type-options", "nosniff")
+        .header("content-security-policy", "default-src 'none'")
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -579,6 +614,8 @@ fn json_response(json: serde_json::Value) -> Result<Response, AppError> {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-providarr-source", "provider")
+        .header("x-content-type-options", "nosniff")
+        .header("content-security-policy", "default-src 'none'")
         .body(axum::body::Body::from(body))
         .map_err(|err| AppError::Internal(err.to_string()))
 }
@@ -636,10 +673,13 @@ async fn inbound_middleware(
             .into_response();
     };
 
-    if state.inbound.is_bypassed(ip) {
+    // A bypassed address is exempt only from its *per-IP* bucket below. The
+    // server-wide ceiling and concurrency cap are enforced for everyone so a
+    // misconfigured/attacker-reachable bypass cannot disable them.
+    let bypassed = state.inbound.is_bypassed(ip);
+    if bypassed {
         crate::metrics::inbound_bypassed();
-        tracing::debug!(client_ip = %ip, method = %method, path = %path, "inbound request exempt via bypass rule");
-        return next.run(request).await;
+        tracing::debug!(client_ip = %ip, method = %method, path = %path, "inbound request exempt from per-IP bucket via bypass rule");
     }
 
     // The server-wide ceiling runs *before* the per-IP bucket is allocated or
@@ -660,7 +700,7 @@ async fn inbound_middleware(
         return too_many_requests(retry_after_secs);
     }
 
-    if let Err(wait) = state.inbound.check(ip) {
+    if !bypassed && let Err(wait) = state.inbound.check(ip) {
         crate::metrics::inbound_limited();
         let retry_after_secs = retry_after_secs(wait);
 
@@ -676,20 +716,26 @@ async fn inbound_middleware(
     }
 
     // Hold the permit for the whole request so the cap is honoured during upstream work.
-    let _permit = match state.inbound.acquire_concurrency() {
-        Ok(permit) => permit,
-        Err(wait) => {
-            crate::metrics::inbound_concurrency_limited();
-            let retry_after_secs = retry_after_secs(wait);
+    // The unauthenticated liveness probe is exempt: otherwise a `/health` flood
+    // could hold every in-flight slot while the database stalls.
+    let _permit = if is_liveness_probe(&path) {
+        None
+    } else {
+        match state.inbound.acquire_concurrency() {
+            Ok(permit) => permit,
+            Err(wait) => {
+                crate::metrics::inbound_concurrency_limited();
+                let retry_after_secs = retry_after_secs(wait);
 
-            tracing::warn!(
-                client_ip = %ip,
-                method = %method,
-                path = %path,
-                "inbound concurrency limit hit; request rejected with 429"
-            );
+                tracing::warn!(
+                    client_ip = %ip,
+                    method = %method,
+                    path = %path,
+                    "inbound concurrency limit hit; request rejected with 429"
+                );
 
-            return too_many_requests(retry_after_secs);
+                return too_many_requests(retry_after_secs);
+            }
         }
     };
 
@@ -749,14 +795,124 @@ fn client_ip(request: &axum::extract::Request, inbound: &InboundLimiter) -> Opti
         .join(",");
     let forwarded_for = (!forwarded_for.is_empty()).then_some(forwarded_for);
 
+    // A reverse proxy that *appends* its own `X-Real-IP` leaves the attacker's
+    // value first; trust the last (closest-to-us) value instead. An empty or
+    // unparseable last value yields `None` and the resolver falls back to XFF.
     let real_ip = request
         .headers()
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok());
+        .get_all("x-real-ip")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .next_back();
 
     Some(inbound.resolve_client_ip(peer, forwarded_for.as_deref(), real_ip))
 }
 
+/// Paths that must never consume an inbound concurrency slot: they are tiny,
+/// unauthenticated liveness probes that must stay answerable under load.
+fn is_liveness_probe(path: &str) -> bool {
+    path == "/health"
+}
+
 async fn not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::InboundLimiterConfig;
+    use crate::inbound::IpRule;
+    use axum::extract::ConnectInfo;
+
+    fn base_config() -> InboundLimiterConfig {
+        InboundLimiterConfig {
+            enabled: true,
+            requests_per_second: 1.0,
+            burst: 1,
+            global_requests_per_second: 0.0,
+            global_burst: 1,
+            max_concurrent: 0,
+            trust_forwarded_for: true,
+            bypass: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn content_type_parameters_cannot_smuggle_json() {
+        // A `contains("+json")` check over the whole header would accept this,
+        // even though it is active XHTML.
+        let attack = "application/xhtml+xml;foo=\"+json\"";
+        assert!(!is_safe_content_type(attack));
+        assert!(!is_json_content_type(attack));
+        assert_eq!(base_media_type(attack), "application/xhtml+xml");
+    }
+
+    #[test]
+    fn rejects_active_content_types() {
+        for value in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "image/svg+xml",
+            "image/svg+xml; charset=utf-8",
+            "application/atom+xml",
+            "application/xhtml+xml",
+        ] {
+            assert!(!is_safe_content_type(value), "{value} must be rejected");
+        }
+    }
+
+    #[test]
+    fn accepts_expected_content_types() {
+        for value in [
+            "application/json",
+            "Application/JSON",
+            "application/json; charset=utf-8",
+            "application/vnd.api+json",
+            "text/plain; charset=utf-8",
+            "image/png",
+            "application/octet-stream",
+        ] {
+            assert!(is_safe_content_type(value), "{value} must be accepted");
+        }
+    }
+
+    #[test]
+    fn json_suffix_must_be_exact() {
+        assert!(is_json_content_type("application/vnd.api+json"));
+        assert!(is_json_content_type("application/json; charset=utf-8"));
+        assert!(!is_json_content_type("application/jsonp"));
+        assert!(!is_json_content_type("application/atom+xml"));
+    }
+
+    #[test]
+    fn x_real_ip_prefers_the_last_value() {
+        let limiter = InboundLimiter::with_trusted_proxies(
+            &base_config(),
+            vec![IpRule::parse("10.0.0.0/8").unwrap()],
+        );
+
+        let peer: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let mut request = axum::extract::Request::builder()
+            .uri("/v1/x")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+            .headers_mut()
+            .append("x-real-ip", "1.2.3.4".parse().unwrap());
+        request
+            .headers_mut()
+            .append("x-real-ip", "203.0.113.7".parse().unwrap());
+
+        let ip = client_ip(&request, &limiter).expect("peer resolves");
+        assert_eq!(ip, "203.0.113.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn only_health_is_concurrency_exempt() {
+        assert!(is_liveness_probe("/health"));
+        assert!(!is_liveness_probe("/v1/policy"));
+        assert!(!is_liveness_probe("/health/extra"));
+    }
 }
