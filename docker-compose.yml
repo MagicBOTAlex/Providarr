@@ -50,6 +50,12 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      # The entrypoint maps PUID/PGID (chown + privilege drop) before exec'ing
+      # the app; nothing else needs capabilities.
+      - CHOWN
+      - SETUID
+      - SETGID
     read_only: true
     tmpfs:
       - /tmp
@@ -59,6 +65,9 @@ services:
       # Overrides whatever DATABASE_URL is in .env so it targets the service.
       DATABASE_URL: postgres://providarr:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/providarr
       PROVIDARR_CONFIG: /app/config/config.json
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Etc/UTC}
     ports:
       - "4155:4155"
     volumes:

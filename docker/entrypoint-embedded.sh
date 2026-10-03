@@ -15,6 +15,35 @@ if ! [[ "$PGPORT" =~ ^[0-9]+$ ]] || (( PGPORT < 1 || PGPORT > 65535 )); then
     exit 1
 fi
 
+# LinuxServer.io-style PUID/PGID/TZ mapping for the Providarr process. The
+# embedded Postgres keeps its own `postgres` user and its own data ownership.
+PUID="${PUID:-1000}"
+PGID="${PGID:-1000}"
+TZ="${TZ:-Etc/UTC}"
+
+case "$PUID" in
+    '' | *[!0-9]*)
+        echo "[entrypoint] invalid PUID '$PUID': expected a numeric uid" >&2
+        exit 1
+        ;;
+esac
+case "$PGID" in
+    '' | *[!0-9]*)
+        echo "[entrypoint] invalid PGID '$PGID': expected a numeric gid" >&2
+        exit 1
+        ;;
+esac
+
+if [ -f "/usr/share/zoneinfo/$TZ" ]; then
+    { ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime; echo "$TZ" > /etc/timezone; } 2>/dev/null || true
+else
+    echo "[entrypoint] warning: unknown TZ '$TZ'; leaving the timezone unchanged" >&2
+fi
+
+mkdir -p /app/logs /app/config 2>/dev/null || true
+chown -R "$PUID:$PGID" /app/logs 2>/dev/null || true
+chown -R "$PUID:$PGID" /app/config 2>/dev/null || true
+
 mkdir -p "$PGDATA"
 chown -R postgres:postgres "$PGDATA"
 chmod 700 "$PGDATA"
@@ -103,8 +132,8 @@ shutdown() {
 
 trap shutdown TERM INT
 
-echo "[entrypoint] launching providarr"
-gosu providarr /usr/local/bin/providarr &
+echo "[entrypoint] launching providarr as uid=${PUID} gid=${PGID} TZ=${TZ}"
+setpriv --reuid="$PUID" --regid="$PGID" --clear-groups /usr/local/bin/providarr &
 PROVIDARR_PID=$!
 
 set +e

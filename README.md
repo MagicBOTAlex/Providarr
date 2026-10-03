@@ -151,6 +151,20 @@ Providers: `tmdb` (`https://api.themoviedb.org/3`, `TMDB_API_TOKEN`) and `tvdb`
   `DATABASE_URL` are read from environment variables. Do not commit them; `.env` is gitignored and
   the Docker images are built without secrets.
 
+### Container user and timezone (LinuxServer.io style)
+
+Both images start as root only long enough to map the app user and timezone, then drop privileges:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PUID` | `1000` | UID the `providarr` process runs as; `/app/logs` and `/app/config` are chowned to it. |
+| `PGID` | `1000` | GID the `providarr` process runs as. |
+| `TZ` | `Etc/UTC` | Timezone database name, e.g. `Europe/London`, `America/New_York`. |
+
+Set these in `.env` so mounted volumes keep the ownership you expect. The external image drops
+privileges with `setpriv` and works under `read_only: true` (compose grants it `CHOWN`, `SETUID`,
+`SETGID`); the embedded image additionally runs its bundled Postgres.
+
 ## Theoriarr integration
 
 Point Theoriarr at Providarr (a restart is required):

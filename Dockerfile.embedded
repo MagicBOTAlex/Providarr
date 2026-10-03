@@ -15,11 +15,12 @@ RUN cargo build --release --locked
 # ---- runtime stage (Postgres base already ships postgres + gosu) ------------
 FROM postgres:16-bookworm@sha256:efedf3595f1d6f415c08568ba171029bf54052e754cc9f030e3f2412b21f3d67 AS runtime
 
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl \
+        ca-certificates curl tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --uid 10001 --home-dir /app --create-home --shell /usr/sbin/nologin providarr
+RUN useradd --system --uid 1000 --home-dir /app --create-home --shell /usr/sbin/nologin providarr
 
 WORKDIR /app
 COPY --from=builder /build/target/release/providarr /usr/local/bin/providarr
