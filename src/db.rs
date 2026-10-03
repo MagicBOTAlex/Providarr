@@ -1,8 +1,16 @@
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 
 use crate::{config::DatabaseConfig, error::AppError, ratelimit::stats::EndpointStatSnapshot};
+
+/// Upper bound on the number of endpoint-stat rows loaded into memory at
+/// startup. Rows are ordered by `updated_at` (indexed by
+/// `endpoint_stats_updated_at_idx`) so the most recently active endpoints win
+/// and startup memory stays bounded even if the table has grown large.
+const STARTUP_ENDPOINT_STATS_LIMIT: i64 = 50_000;
 
 pub async fn connect(cfg: &DatabaseConfig) -> Result<PgPool, AppError> {
     let pool = PgPoolOptions::new()
@@ -23,8 +31,10 @@ pub async fn load_endpoint_stats(pool: &PgPool) -> Result<Vec<EndpointStatSnapsh
     let rows = sqlx::query(
         "SELECT provider, endpoint, requests_total, requests_since_limit, rate_limit_hits, \
          failures, successes, dropped, last_status, last_request_at, last_rate_limit_at, \
-         observed_limit_threshold, noted_limit FROM endpoint_stats",
+         observed_limit_threshold, noted_limit FROM endpoint_stats \
+         ORDER BY updated_at DESC LIMIT $1",
     )
+    .bind(STARTUP_ENDPOINT_STATS_LIMIT)
     .fetch_all(pool)
     .await?;
 
@@ -119,6 +129,32 @@ pub async fn insert_rate_limit_event(
     Ok(())
 }
 
+/// Delete endpoint-stat rows that have not been updated within `older_than`.
+/// Returns the number of rows removed. The cutoff is computed in Postgres and
+/// passed as a bound interval parameter; the predicate is sargable against
+/// `endpoint_stats_updated_at_idx`.
+pub async fn prune_endpoint_stats(pool: &PgPool, older_than: Duration) -> Result<u64, AppError> {
+    let result = sqlx::query(
+        "DELETE FROM endpoint_stats WHERE updated_at < now() - make_interval(secs => $1)",
+    )
+    .bind(older_than.as_secs_f64())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Delete rate-limit audit rows older than `older_than`. Returns the number of
+/// rows removed. Backed by `rate_limit_events_occurred_at_idx`.
+pub async fn prune_rate_limit_events(pool: &PgPool, older_than: Duration) -> Result<u64, AppError> {
+    let result = sqlx::query(
+        "DELETE FROM rate_limit_events WHERE occurred_at < now() - make_interval(secs => $1)",
+    )
+    .bind(older_than.as_secs_f64())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn ping(pool: &PgPool) -> Result<(), AppError> {
     sqlx::query("SELECT 1").execute(pool).await?;
     Ok(())
@@ -195,16 +231,35 @@ pub async fn load_rate_limit_events(
     provider: Option<&str>,
     limit: i64,
 ) -> Result<Vec<RateLimitEventRow>, AppError> {
-    let rows = sqlx::query(
-        "SELECT provider, endpoint, occurred_at, requests_since_last_limit, status_code, detail \
-         FROM rate_limit_events \
-         WHERE ($1::text IS NULL OR provider = $1) \
-         ORDER BY occurred_at DESC LIMIT $2",
-    )
-    .bind(provider)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    // Keep the two branches separate so each uses an index: the unfiltered
+    // branch is backed by `rate_limit_events_occurred_at_idx`, while the
+    // provider-filtered branch uses
+    // `rate_limit_events_provider_idx (provider, occurred_at DESC)`. A single
+    // `($1 IS NULL OR provider = $1)` predicate is not sargable and would force
+    // a full scan plus sort.
+    const COLUMNS: &str =
+        "provider, endpoint, occurred_at, requests_since_last_limit, status_code, detail";
+    let rows = match provider {
+        Some(provider) => {
+            sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM rate_limit_events \
+                 WHERE provider = $1 ORDER BY occurred_at DESC LIMIT $2",
+            ))
+            .bind(provider)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM rate_limit_events \
+                 ORDER BY occurred_at DESC LIMIT $1",
+            ))
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
 
     Ok(rows
         .into_iter()
