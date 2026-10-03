@@ -15,6 +15,33 @@ const MAX_CONCURRENT_CAP: u32 = 65_535;
 /// single search hydrate the whole provider result set.
 const MAX_HYDRATE_LIMIT: usize = 100;
 
+/// Upper bound on `backoff.max_delay` so a hostile config cannot overflow
+/// `Instant` arithmetic when scheduling the next retry.
+const MAX_BACKOFF_MAX_DELAY: Duration = Duration::from_secs(3_600);
+
+/// Upper bound on `backoff.max_request_timeout` (10 minutes).
+const MAX_BACKOFF_MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Upper bound on `backoff.max_consecutive_failures` so a hostile config cannot
+/// pin a provider in an effectively unbounded lockout.
+const MAX_CONSECUTIVE_FAILURES_CAP: u32 = 100;
+
+/// Upper bound on `cache.max_ttl` (365 days).
+const MAX_CACHE_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Upper bound on `cache.max_body_bytes` (64 MiB).
+const MAX_CACHE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Smallest non-zero requests/second value. Periods are the reciprocal, so
+/// anything smaller risks overflowing the rate-limiter's `Instant`.
+const MIN_REQUESTS_PER_SECOND: f64 = 1e-6;
+
+/// Rejects rates that are non-finite, negative, or too small to invert safely.
+/// `0.0` is allowed and means "disabled".
+fn invalid_requests_per_second(value: f64) -> bool {
+    !value.is_finite() || value < 0.0 || (value > 0.0 && value < MIN_REQUESTS_PER_SECOND)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
@@ -54,6 +81,7 @@ impl AppConfig {
 
         apply_inbound_env_overrides(&mut config)?;
         apply_logging_env_overrides(&mut config)?;
+        apply_api_auth_env_overrides(&mut config)?;
 
         config.validate()?;
         Ok(config)
@@ -64,6 +92,11 @@ impl AppConfig {
             return Err(AppError::Config(
                 "database.url is empty (set DATABASE_URL or config.database.url)".into(),
             ));
+        }
+        if self.database.url.contains("providarr:providarr") {
+            tracing::warn!(
+                "database.url uses the default providarr:providarr credentials; rotate them for any non-local deployment"
+            );
         }
 
         if self.search.hydrate_limit > MAX_HYDRATE_LIMIT {
@@ -100,6 +133,26 @@ impl AppConfig {
                 "backoff.max_consecutive_failures must be > 0".into(),
             ));
         }
+        if backoff.max_consecutive_failures > MAX_CONSECUTIVE_FAILURES_CAP {
+            return Err(AppError::Config(format!(
+                "backoff.max_consecutive_failures must be <= {MAX_CONSECUTIVE_FAILURES_CAP} (got {})",
+                backoff.max_consecutive_failures
+            )));
+        }
+        if backoff.max_delay > MAX_BACKOFF_MAX_DELAY {
+            return Err(AppError::Config(format!(
+                "backoff.max_delay must be <= {}s (got {}s)",
+                MAX_BACKOFF_MAX_DELAY.as_secs(),
+                backoff.max_delay.as_secs()
+            )));
+        }
+        if backoff.max_request_timeout > MAX_BACKOFF_MAX_REQUEST_TIMEOUT {
+            return Err(AppError::Config(format!(
+                "backoff.max_request_timeout must be <= {}s (got {}s)",
+                MAX_BACKOFF_MAX_REQUEST_TIMEOUT.as_secs(),
+                backoff.max_request_timeout.as_secs()
+            )));
+        }
 
         for (name, provider) in &self.providers {
             if provider.base_url.trim().is_empty() {
@@ -107,9 +160,9 @@ impl AppConfig {
                     "providers.{name}.base_url is empty"
                 )));
             }
-            if !provider.requests_per_second.is_finite() || provider.requests_per_second < 0.0 {
+            if invalid_requests_per_second(provider.requests_per_second) {
                 return Err(AppError::Config(format!(
-                    "providers.{name}.requests_per_second must be a finite number >= 0"
+                    "providers.{name}.requests_per_second must be exactly 0 or a finite number >= {MIN_REQUESTS_PER_SECOND}"
                 )));
             }
             if provider.burst == 0 {
@@ -123,15 +176,20 @@ impl AppConfig {
                 )));
             }
             for (segment, rps) in &provider.endpoint_rps {
-                if !rps.is_finite() || *rps < 0.0 {
+                if invalid_requests_per_second(*rps) {
                     return Err(AppError::Config(format!(
-                        "providers.{name}.endpoint_rps.{segment} must be a finite number >= 0"
+                        "providers.{name}.endpoint_rps.{segment} must be exactly 0 or a finite number >= {MIN_REQUESTS_PER_SECOND}"
                     )));
                 }
             }
         }
 
         let inbound = &self.inbound;
+        if !inbound.enabled {
+            tracing::warn!(
+                "inbound rate limiting is disabled; requests are not throttled (set PROVIDARR_INBOUND_ENABLED=true to enable)"
+            );
+        }
         if !inbound.requests_per_second.is_finite() || inbound.requests_per_second < 0.0 {
             return Err(AppError::Config(
                 "inbound.requests_per_second must be a finite number >= 0".into(),
@@ -159,9 +217,34 @@ impl AppConfig {
         if self.cache.max_body_bytes == 0 {
             return Err(AppError::Config("cache.max_body_bytes must be > 0".into()));
         }
+        if self.cache.max_body_bytes > MAX_CACHE_BODY_BYTES {
+            return Err(AppError::Config(format!(
+                "cache.max_body_bytes must be <= {MAX_CACHE_BODY_BYTES} (got {})",
+                self.cache.max_body_bytes
+            )));
+        }
+        if self.cache.max_ttl > MAX_CACHE_TTL {
+            return Err(AppError::Config(format!(
+                "cache.max_ttl must be <= {}s (got {}s)",
+                MAX_CACHE_TTL.as_secs(),
+                self.cache.max_ttl.as_secs()
+            )));
+        }
         if self.cache.default_ttl > self.cache.max_ttl {
             return Err(AppError::Config(
                 "cache.default_ttl must be <= cache.max_ttl".into(),
+            ));
+        }
+        if self.cache.stale_if_error > self.cache.max_ttl {
+            return Err(AppError::Config(
+                "cache.stale_if_error must be <= cache.max_ttl".into(),
+            ));
+        }
+
+        if self.api_auth.enabled && self.api_auth.api_key.trim().is_empty() {
+            return Err(AppError::Config(
+                "api_auth.enabled is true but api_auth.api_key is empty; set PROVIDARR_API_AUTH_KEY or disable api_auth"
+                    .into(),
             ));
         }
 
@@ -253,6 +336,27 @@ fn apply_logging_env_overrides(config: &mut AppConfig) -> Result<(), AppError> {
     }
     if let Some(value) = env_parse::<bool>("PROVIDARR_LOG_STDOUT", parse_bool)? {
         config.logging.stdout = value;
+    }
+    Ok(())
+}
+
+/// Applies `PROVIDARR_API_AUTH_*` environment overrides on top of the JSON/default config.
+///
+/// This lets deployments inject the shared secret without committing it to
+/// `config/config.json`.
+fn apply_api_auth_env_overrides(config: &mut AppConfig) -> Result<(), AppError> {
+    if let Some(value) = env_parse::<bool>("PROVIDARR_API_AUTH_ENABLED", parse_bool)? {
+        config.api_auth.enabled = value;
+    }
+    if let Ok(value) = std::env::var("PROVIDARR_API_AUTH_KEY")
+        && !value.trim().is_empty()
+    {
+        config.api_auth.api_key = value;
+    }
+    if let Ok(value) = std::env::var("PROVIDARR_API_AUTH_HEADER")
+        && !value.trim().is_empty()
+    {
+        config.api_auth.header = value;
     }
     Ok(())
 }
@@ -779,6 +883,85 @@ mod tests {
     fn rejects_unknown_config_fields() {
         let raw = r#"{"cache": {"enabled": true, "not_a_real_field": 1}}"#;
         assert!(serde_json::from_str::<AppConfig>(raw).is_err());
+    }
+
+    #[test]
+    fn api_auth_is_fail_closed_when_enabled_without_key() {
+        let mut config = AppConfig::default();
+        config.api_auth.enabled = true;
+        config.api_auth.api_key = String::new();
+        assert!(config.validate().is_err());
+
+        config.api_auth.enabled = true;
+        config.api_auth.api_key = "sekret".into();
+        assert!(config.validate().is_ok());
+
+        config.api_auth.enabled = false;
+        config.api_auth.api_key = String::new();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_caps_hostile_timers_and_lockouts() {
+        let mut config = AppConfig::default();
+        config.backoff.max_delay = Duration::from_secs(MAX_BACKOFF_MAX_DELAY.as_secs() + 1);
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.backoff.max_request_timeout =
+            Duration::from_secs(MAX_BACKOFF_MAX_REQUEST_TIMEOUT.as_secs() + 1);
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.backoff.max_consecutive_failures = MAX_CONSECUTIVE_FAILURES_CAP + 1;
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.cache.max_ttl = MAX_CACHE_TTL + Duration::from_secs(1);
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.cache.stale_if_error = config.cache.max_ttl + Duration::from_secs(1);
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.cache.max_body_bytes = MAX_CACHE_BODY_BYTES + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_uninvertible_rate_limits() {
+        let mut config = AppConfig::default();
+        config
+            .providers
+            .get_mut("tmdb")
+            .unwrap()
+            .requests_per_second = MIN_REQUESTS_PER_SECOND / 2.0;
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config
+            .providers
+            .get_mut("tmdb")
+            .unwrap()
+            .endpoint_rps
+            .insert("search".into(), MIN_REQUESTS_PER_SECOND / 2.0);
+        assert!(config.validate().is_err());
+
+        // Exactly zero and the minimum accepted value are both allowed.
+        let mut config = AppConfig::default();
+        config
+            .providers
+            .get_mut("tmdb")
+            .unwrap()
+            .requests_per_second = 0.0;
+        config
+            .providers
+            .get_mut("tmdb")
+            .unwrap()
+            .endpoint_rps
+            .insert("search".into(), MIN_REQUESTS_PER_SECOND);
+        assert!(config.validate().is_ok());
     }
 
     #[test]
