@@ -8,6 +8,17 @@ use crate::{error::AppError, state::AppState};
 
 use super::fetch_json;
 
+// Amplification caps. TVDB payloads for long-running shows are large and
+// attacker-amplifiable (one request fans out into many upstream calls), so
+// every fan-out and output collection is bounded.
+const MAX_EPISODE_PAGES: usize = 20;
+const MAX_EPISODES: usize = 2_000;
+const MAX_DISTINCT_SEASONS: usize = 100;
+const MAX_ACTORS: usize = 100;
+const MAX_GENRES: usize = 50;
+const MAX_ALTERNATIVE_TITLES: usize = 100;
+const MAX_REMOTE_IDS: usize = 50;
+
 // ---------------------------------------------------------------------------
 // Output resources (SkyHook shape, camelCase)
 // ---------------------------------------------------------------------------
@@ -386,6 +397,7 @@ fn distinct_seasons(episodes: &[TvdbEpisode]) -> Vec<i64> {
     let mut seasons: Vec<i64> = episodes.iter().filter_map(|e| e.season_number).collect();
     seasons.sort_unstable();
     seasons.dedup();
+    seasons.truncate(MAX_DISTINCT_SEASONS);
     seasons
 }
 
@@ -524,7 +536,7 @@ async fn fetch_episodes(
 ) -> Result<Vec<TvdbEpisode>, AppError> {
     let mut episodes = Vec::new();
 
-    for page in 0..20 {
+    for page in 0..MAX_EPISODE_PAGES {
         let value: serde_json::Value = fetch_json(
             state,
             "tvdb",
@@ -547,6 +559,11 @@ async fn fetch_episodes(
             if let Ok(episode) = serde_json::from_value::<TvdbEpisode>(item) {
                 episodes.push(episode);
             }
+        }
+
+        if episodes.len() >= MAX_EPISODES {
+            episodes.truncate(MAX_EPISODES);
+            break;
         }
 
         let has_next = value
@@ -615,6 +632,7 @@ fn map_show(
             .collect();
         parsed.sort_unstable();
         parsed.dedup();
+        parsed.truncate(MAX_REMOTE_IDS);
         parsed
     };
 
@@ -714,13 +732,19 @@ fn map_show(
                             image: c.person_img_url.clone(),
                         })
                     })
+                    .take(MAX_ACTORS)
                     .collect()
             })
             .unwrap_or_default(),
         genres: extended
             .genres
             .as_ref()
-            .map(|g| g.iter().filter_map(|n| n.name.clone()).collect())
+            .map(|g| {
+                g.iter()
+                    .filter_map(|n| n.name.clone())
+                    .take(MAX_GENRES)
+                    .collect()
+            })
             .unwrap_or_default(),
         content_rating: pick_content_rating(extended),
         rating,
@@ -739,6 +763,7 @@ fn map_show(
                     })
                     .collect();
                 titles.dedup_by(|a, b| a.title == b.title);
+                titles.truncate(MAX_ALTERNATIVE_TITLES);
                 titles
             })
             .unwrap_or_default(),
@@ -1010,6 +1035,27 @@ mod tests {
         assert_eq!(shows[0].imdb_id.as_deref(), Some("tt0000002"));
         assert_eq!(shows[0].first_aired.as_deref(), Some("2020-01-02"));
         assert_eq!(shows[0].images.len(), 1);
+    }
+
+    #[test]
+    fn distinct_seasons_is_capped() {
+        let episodes: Vec<TvdbEpisode> = (0..(MAX_DISTINCT_SEASONS as i64 + 50))
+            .map(|n| TvdbEpisode {
+                id: n,
+                name: None,
+                aired: None,
+                season_number: Some(n),
+                number: Some(1),
+                absolute_number: None,
+                runtime: None,
+                overview: None,
+                image: None,
+                finale_type: None,
+            })
+            .collect();
+
+        let seasons = distinct_seasons(&episodes);
+        assert_eq!(seasons.len(), MAX_DISTINCT_SEASONS);
     }
 
     #[test]
