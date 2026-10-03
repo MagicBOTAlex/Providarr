@@ -28,9 +28,9 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgres://providarr:providarr@127.0.0.1:5432/providarr
+      DATABASE_URL: postgres://providarr:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/providarr
       POSTGRES_USER: providarr
-      POSTGRES_PASSWORD: providarr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: providarr
       PROVIDARR_CONFIG: /app/config/config.json
     ports:

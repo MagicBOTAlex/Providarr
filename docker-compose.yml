@@ -4,7 +4,8 @@
 #   docker compose up -d --build
 #
 # Secrets are read from `.env` (gitignored). The DATABASE_URL in `.env` is
-# overridden below to point at the `postgres` service.
+# overridden below to point at the `postgres` service, using the same
+# POSTGRES_PASSWORD, which must be set in `.env` (compose interpolation).
 name: providarr
 
 services:
@@ -29,7 +30,7 @@ services:
       - /var/run/postgresql
     environment:
       POSTGRES_USER: providarr
-      POSTGRES_PASSWORD: providarr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: providarr
     volumes:
       - providarr-postgres:/var/lib/postgresql/data
@@ -56,7 +57,7 @@ services:
       - .env
     environment:
       # Overrides whatever DATABASE_URL is in .env so it targets the service.
-      DATABASE_URL: postgres://providarr:providarr@postgres:5432/providarr
+      DATABASE_URL: postgres://providarr:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/providarr
       PROVIDARR_CONFIG: /app/config/config.json
     ports:
       - "4155:4155"

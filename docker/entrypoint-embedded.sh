@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Starts an embedded Postgres, ensures the Providarr role/database exist, then
-# runs Providarr in the foreground.
+# runs Providarr. As PID 1 this script must forward signals to Providarr and
+# shut Postgres down cleanly before exiting.
 set -euo pipefail
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"
@@ -8,6 +9,11 @@ DB_USER="${POSTGRES_USER:-providarr}"
 DB_PASSWORD="${POSTGRES_PASSWORD:-providarr}"
 DB_NAME="${POSTGRES_DB:-providarr}"
 PGPORT="${PGPORT:-5432}"
+
+if ! [[ "$PGPORT" =~ ^[0-9]+$ ]] || (( PGPORT < 1 || PGPORT > 65535 )); then
+    echo "[entrypoint] invalid PGPORT '$PGPORT': expected an integer in 1-65535" >&2
+    exit 1
+fi
 
 mkdir -p "$PGDATA"
 chown -R postgres:postgres "$PGDATA"
@@ -59,10 +65,52 @@ fi
 
 if ! database_exists | grep -q 1; then
     echo "[entrypoint] creating database ${DB_NAME}"
-    gosu postgres createdb -O "${DB_USER}" "${DB_NAME}"
+    gosu postgres createdb -O "$DB_USER" -- "$DB_NAME"
 fi
 
 export DATABASE_URL="${DATABASE_URL:-postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${PGPORT}/${DB_NAME}}"
-echo "[entrypoint] launching providarr"
 
-exec gosu providarr /usr/local/bin/providarr
+PROVIDARR_PID=""
+postgres_stopped=0
+
+stop_postgres() {
+    if [ "$postgres_stopped" -eq 0 ]; then
+        postgres_stopped=1
+        echo "[entrypoint] stopping embedded postgres"
+        gosu postgres pg_ctl -D "$PGDATA" -m fast -w stop || true
+    fi
+}
+
+shutdown() {
+    # Only handle the first signal; ignore further TERM/INT while draining.
+    trap '' TERM INT
+    echo "[entrypoint] received shutdown signal, stopping providarr"
+    if [ -n "$PROVIDARR_PID" ] && kill -0 "$PROVIDARR_PID" 2>/dev/null; then
+        kill -TERM "$PROVIDARR_PID" 2>/dev/null || true
+        # Give providarr up to ~8s to exit gracefully, but never block longer
+        # than Docker's default 10s stop grace period.
+        for ((i = 0; i < 80; i++)); do
+            kill -0 "$PROVIDARR_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
+    stop_postgres
+    if [ -n "$PROVIDARR_PID" ] && kill -0 "$PROVIDARR_PID" 2>/dev/null; then
+        kill -KILL "$PROVIDARR_PID" 2>/dev/null || true
+    fi
+    wait "$PROVIDARR_PID" 2>/dev/null || true
+}
+
+trap shutdown TERM INT
+
+echo "[entrypoint] launching providarr"
+gosu providarr /usr/local/bin/providarr &
+PROVIDARR_PID=$!
+
+set +e
+wait "$PROVIDARR_PID"
+STATUS=$?
+set -e
+
+stop_postgres
+exit "$STATUS"
