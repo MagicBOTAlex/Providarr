@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -57,6 +64,17 @@ pub struct ProviderRegistry {
     /// so only the first performs the upstream fetch; unrelated keys never
     /// contend. Entries are removed once no request holds the lock.
     coalesce: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Number of entries currently in `coalesce`, tracked with an atomic so it
+    /// can be read while a DashMap shard guard is held (taking `DashMap::len`
+    /// there could self-deadlock).
+    coalesce_len: Arc<AtomicUsize>,
+    /// Latches once `coalesce` reaches `MAX_COALESCE_ENTRIES`. From then on new
+    /// keys use the fallback shards, so a key can never race between a per-key
+    /// lock and a shard lock.
+    coalesce_saturated: Arc<AtomicBool>,
+    /// Fixed pool of sharded fallback locks. When `coalesce` is saturated,
+    /// identical keys still hash to the same shard and therefore serialise.
+    coalesce_shards: Arc<[Arc<tokio::sync::Mutex<()>>]>,
     /// Keys with an in-flight background revalidation. Prevents a burst of stale
     /// requests for the same key from spawning one upstream refresh each.
     revalidating: Arc<DashMap<String, ()>>,
@@ -66,12 +84,25 @@ pub struct ProviderRegistry {
 }
 
 /// Hard ceiling on tracked single-flight keys, guarding against unbounded map
-/// growth under a flood of distinct keys. Once exceeded, requests stop
-/// coalescing and simply fetch on their own.
+/// growth under a flood of distinct keys. Once exceeded, new keys fall back to
+/// the shard locks instead of giving up coalescing, so identical keys still
+/// serialise.
 const MAX_COALESCE_ENTRIES: usize = 10_000;
 
-/// Maximum number of background revalidations allowed to run at once.
-const MAX_CONCURRENT_REVALIDATIONS: usize = 32;
+/// Number of fallback lock shards. Identical keys always map to the same shard,
+/// so the single-flight invariant holds even once the per-key map is saturated.
+const COALESCE_SHARDS: usize = 256;
+
+/// Bounds on how long a request waits for an in-flight identical fetch. The
+/// holder can run `max_retries + 1` attempts, so allow for all of them, but
+/// never queue behind a struggling upstream without limit.
+const COALESCE_WAIT_FLOOR: Duration = Duration::from_secs(5);
+const COALESCE_WAIT_CEILING: Duration = Duration::from_secs(120);
+
+/// Maximum number of background revalidations allowed to run at once. Kept
+/// small so a burst of stale keys cannot occupy a large share of a provider's
+/// foreground concurrency slots.
+const MAX_CONCURRENT_REVALIDATIONS: usize = 4;
 
 impl ProviderRegistry {
     pub fn build(
@@ -114,6 +145,12 @@ impl ProviderRegistry {
             coalescing_enabled: config.cache.request_coalescing,
             backoff_max_delay: config.backoff.max_delay,
             coalesce: Arc::new(DashMap::new()),
+            coalesce_len: Arc::new(AtomicUsize::new(0)),
+            coalesce_saturated: Arc::new(AtomicBool::new(false)),
+            coalesce_shards: (0..COALESCE_SHARDS)
+                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                .collect::<Vec<_>>()
+                .into(),
             revalidating: Arc::new(DashMap::new()),
             revalidation_permits: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_REVALIDATIONS,
@@ -180,7 +217,8 @@ impl ProviderRegistry {
         method: &str,
         path_and_query: &str,
     ) -> Result<ProviderResponse, AppError> {
-        self.provider(provider_name)
+        let provider = self
+            .provider(provider_name)
             .ok_or_else(|| AppError::UnknownProvider(provider_name.to_string()))?;
 
         let method_upper = method.to_ascii_uppercase();
@@ -219,17 +257,11 @@ impl ProviderRegistry {
         }
 
         let cache_key = CacheStore::key(provider_name, &method_upper, path_and_query);
-
-        // Single-flight: a per-key lock so a burst of identical misses triggers
-        // at most one upstream call, without unrelated keys blocking each other.
-        let _coalesce = if self.cache.enabled() && self.coalescing_enabled {
-            self.acquire_coalesce(&cache_key).await
-        } else {
-            None
-        };
-
         let now = Utc::now();
 
+        // Cache hits and serve-stale-immediately do not need the single-flight
+        // lock; only an actual upstream fetch does. This keeps the lock held
+        // for the fetch alone, never across the cache lookup.
         let mut stale: Option<CachedEntry> = None;
         if self.cache.enabled() {
             match self.cache.get(&cache_key).await {
@@ -270,6 +302,44 @@ impl ProviderRegistry {
             metrics::cache_miss(provider_name, &endpoint);
         }
 
+        // Single-flight: a per-key lock so a burst of identical misses triggers
+        // at most one upstream call, without unrelated keys blocking each other.
+        // Existing/hot keys are always coalesced, even once the registry is
+        // saturated. The wait is bounded: rather than queue behind a struggling
+        // upstream forever, serve stale or surface an error.
+        let coalesce_guard = if self.cache.enabled() && self.coalescing_enabled {
+            let wait = coalesce_wait_bound(&provider);
+            match self.acquire_coalesce(&cache_key, wait).await {
+                Ok(guard) => Some(guard),
+                Err(err) => {
+                    return match stale {
+                        Some(entry) => {
+                            metrics::cache_stale(provider_name, &endpoint);
+                            Ok(entry_to_response(entry, true))
+                        }
+                        None => Err(err),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
+        // While we waited for the lock another request may have populated the
+        // entry; re-check before doing upstream work.
+        if coalesce_guard.is_some() {
+            match self.cache.get(&cache_key).await {
+                Ok(Some(entry)) if entry.is_fresh(Utc::now()) => {
+                    metrics::cache_hit(provider_name, &endpoint);
+                    return Ok(entry_to_response(entry, false));
+                }
+                Ok(Some(entry)) if entry.is_within_stale_window(now, self.cache.config()) => {
+                    stale = Some(entry);
+                }
+                _ => {}
+            }
+        }
+
         match self
             .fetch_upstream(
                 provider_name,
@@ -291,30 +361,63 @@ impl ProviderRegistry {
         }
     }
 
-    /// Acquires the per-key single-flight lock, inserting a fresh lock on first
-    /// use. Returns `None` (no coalescing) once the registry hits its hard cap,
-    /// so a flood of distinct keys cannot grow the map without bound.
-    async fn acquire_coalesce(self: &Arc<Self>, key: &str) -> Option<CoalesceGuard> {
+    /// Acquires the single-flight lock for `key`, inserting a fresh per-key lock
+    /// on first use.
+    ///
+    /// Once the per-key map is saturated the key is routed to a fixed shard
+    /// lock instead of being left uncoalesced; identical keys therefore always
+    /// serialise regardless of map pressure. The decision is made while holding
+    /// the key's map-shard guard so a key can never straddle both mechanisms.
+    async fn acquire_coalesce(
+        self: &Arc<Self>,
+        key: &str,
+        wait: Duration,
+    ) -> Result<CoalesceGuard, AppError> {
         use dashmap::mapref::entry::Entry;
-
-        if self.coalesce.len() >= MAX_COALESCE_ENTRIES {
-            return None;
-        }
 
         let lock = match self.coalesce.entry(key.to_string()) {
             Entry::Occupied(entry) => Arc::clone(entry.get()),
             Entry::Vacant(entry) => {
+                let saturated = self.coalesce_saturated.load(Ordering::Acquire);
+                let has_room = self.coalesce_len.load(Ordering::Acquire) < MAX_COALESCE_ENTRIES;
+                if saturated || !has_room {
+                    // Latch saturation so a later removal cannot let this key
+                    // race between a per-key lock and a shard lock. The entry
+                    // guard is dropped before the await in `acquire_shard`.
+                    self.coalesce_saturated.store(true, Ordering::Release);
+                    drop(entry);
+                    return self.acquire_coalesce_shard(key, wait).await;
+                }
                 let lock = Arc::new(tokio::sync::Mutex::new(()));
                 entry.insert(Arc::clone(&lock));
+                self.coalesce_len.fetch_add(1, Ordering::AcqRel);
                 lock
             }
         };
         // The map entry guard is dropped before the await below: never hold a
         // `DashMap` reference across `.await`.
-        let guard = Arc::clone(&lock).lock_owned().await;
-        Some(CoalesceGuard {
-            registry: Arc::clone(&self.coalesce),
+        let guard = lock_with_timeout(&lock, wait).await?;
+        Ok(CoalesceGuard {
+            registry: Some(Arc::clone(&self.coalesce)),
+            len: Some(Arc::clone(&self.coalesce_len)),
             key: key.to_string(),
+            guard: Some(guard),
+        })
+    }
+
+    /// Fallback single-flight lock used once the per-key map is saturated.
+    async fn acquire_coalesce_shard(
+        &self,
+        key: &str,
+        wait: Duration,
+    ) -> Result<CoalesceGuard, AppError> {
+        let index = shard_index(key, self.coalesce_shards.len());
+        let lock = Arc::clone(&self.coalesce_shards[index]);
+        let guard = lock_with_timeout(&lock, wait).await?;
+        Ok(CoalesceGuard {
+            registry: None,
+            len: None,
+            key: String::new(),
             guard: Some(guard),
         })
     }
@@ -346,13 +449,18 @@ impl ProviderRegistry {
             }
         }
 
+        // Build the guard in the caller and move it into the task: if the task
+        // is dropped before its first poll it still drops the guard, so the
+        // `revalidating` marker cannot leak.
+        let guard = RevalidationGuard {
+            map: Arc::clone(&self.revalidating),
+            key: cache_key,
+        };
+
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let _permit = permit;
-            let _guard = RevalidationGuard {
-                map: Arc::clone(&this.revalidating),
-                key: cache_key,
-            };
+            let _guard = guard;
             if this
                 .fetch_upstream(
                     &provider_name,
@@ -580,6 +688,10 @@ impl ProviderRegistry {
                 );
 
                 cache_policy_from(cache_control.as_deref(), self.cache.config(), &path)
+            } else if status.is_redirection() {
+                // Redirects are not followed. Never pin a 3xx as a cached
+                // error: surface it as-is and drop any existing entry.
+                CachePolicy::NoStore
             } else {
                 // 404s are stable ("does not exist"), so cache them longer than a
                 // generic 4xx; neither pushes the provider into backoff.
@@ -672,10 +784,13 @@ impl ProviderRegistry {
     }
 }
 
-/// RAII holder for a per-key single-flight lock. Dropping it releases the lock
-/// and then removes the map entry if no other request still holds the lock.
+/// RAII holder for a single-flight lock. Dropping it releases the lock and, for
+/// per-key guards, removes the map entry if no other request still holds it.
 struct CoalesceGuard {
-    registry: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-key registry to prune on release; `None` for shard fallback guards.
+    registry: Option<Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Mirrors the number of live entries in `registry`.
+    len: Option<Arc<AtomicUsize>>,
     key: String,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -685,9 +800,53 @@ impl Drop for CoalesceGuard {
         // Release the mutex first so our own `OwnedMutexGuard` Arc no longer
         // counts; the map plus any waiting request are all that can remain.
         self.guard.take();
-        self.registry
-            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1);
+        if let (Some(registry), Some(len)) = (&self.registry, &self.len)
+            && registry
+                .remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1)
+                .is_some()
+        {
+            len.fetch_sub(1, Ordering::AcqRel);
+        }
     }
+}
+
+/// Acquires an owned mutex guard, giving up after `wait` so a request can never
+/// queue behind an in-flight identical fetch indefinitely.
+async fn lock_with_timeout(
+    lock: &Arc<tokio::sync::Mutex<()>>,
+    wait: Duration,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, AppError> {
+    match tokio::time::timeout(wait, Arc::clone(lock).lock_owned()).await {
+        Ok(guard) => Ok(guard),
+        Err(_) => Err(AppError::Dropped(
+            "timed out waiting for an in-flight identical request".to_string(),
+        )),
+    }
+}
+
+/// Maps a cache key onto one of `shards` buckets. The FNV-1a hash keeps the
+/// mapping stable for the process lifetime without a hasher dependency.
+fn shard_index(key: &str, shards: usize) -> usize {
+    debug_assert!(shards > 0);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) % shards
+}
+
+/// Upper bound on how long a request waits for an in-flight identical fetch.
+/// The holder may run `max_retries + 1` attempts, each bounded by the current
+/// effective request timeout; clamp the total to a sane range.
+fn coalesce_wait_bound(provider: &Provider) -> Duration {
+    let attempts = provider.runtime.max_retries().saturating_add(1);
+    provider
+        .runtime
+        .effective_timeout()
+        .saturating_mul(attempts)
+        .max(COALESCE_WAIT_FLOOR)
+        .min(COALESCE_WAIT_CEILING)
 }
 
 /// Removes the `revalidating` marker on drop, so a panicked or aborted
@@ -789,6 +948,24 @@ fn build_url(base_url: &str, path_and_query: &str) -> Result<String, AppError> {
     {
         return Err(AppError::Internal(
             "request path escapes the configured provider base url".to_string(),
+        ));
+    }
+
+    // Credentials or a fragment in a joined path would be forwarded upstream
+    // (and could smuggle authority); reject them outright.
+    if !joined.username().is_empty() || joined.password().is_some() || joined.fragment().is_some() {
+        return Err(AppError::Internal(
+            "request path introduced userinfo or a fragment".to_string(),
+        ));
+    }
+
+    // A percent-encoded dot or slash can survive URL normalisation and then be
+    // decoded by the upstream, escaping the configured base path (double
+    // encoding). No legitimate provider path needs them.
+    let joined_path = joined.path().to_ascii_lowercase();
+    if joined_path.contains("%2e") || joined_path.contains("%2f") {
+        return Err(AppError::Internal(
+            "request path contained a percent-encoded path segment or separator".to_string(),
         ));
     }
 
@@ -1051,6 +1228,37 @@ mod tests {
             build_url("https://api.example.com/3", "//evil.example.com/x").unwrap(),
             "https://api.example.com/3/evil.example.com/x"
         );
+    }
+
+    #[test]
+    fn build_url_rejects_userinfo_fragment_and_encoded_separators() {
+        for path in [
+            "https://user:pass@api.example.com/3/movie/550",
+            "https://api.example.com/3/movie/550#frag",
+            "/movie/%2Fadmin",
+            "/movie/%2fadmin",
+            "/movie/%2Enpm",
+            "/movie/%2e%2e/%2e%2e/secret",
+        ] {
+            assert!(
+                build_url("https://api.example.com/3", path).is_err(),
+                "expected rejection for {path:?}"
+            );
+        }
+        // A legitimate encoded query value still passes.
+        assert_eq!(
+            build_url("https://api.example.com/3", "/search?query=a%20b").unwrap(),
+            "https://api.example.com/3/search?query=a%20b"
+        );
+    }
+
+    #[test]
+    fn shard_index_is_deterministic_and_bounded() {
+        for key in ["a", "b", "some-long-cache-key"] {
+            let index = shard_index(key, COALESCE_SHARDS);
+            assert!(index < COALESCE_SHARDS);
+            assert_eq!(index, shard_index(key, COALESCE_SHARDS));
+        }
     }
 
     #[test]
