@@ -1749,6 +1749,7 @@ dependencies = [
  "humantime-serde",
  "hyper",
  "hyper-util",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "once_cell",

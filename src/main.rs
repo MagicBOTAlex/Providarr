@@ -1,12 +1,12 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use hyper::server::conn::http1;
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo, TokioTimer},
-    server::conn::auto::Builder as AutoBuilder,
+    rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
 use providarr::{api, config::AppConfig, state::AppState, telemetry};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tower::{Service as _, ServiceExt as _};
 
 /// Retention window for the append-only accounting tables. Rows older than this
@@ -19,6 +19,21 @@ const RETENTION_WINDOW: Duration = Duration::from_secs(60 * 60 * 24 * 30);
 /// `serve` is intentionally unconfigurable, so the server runs a custom hyper
 /// accept loop that can set this on the connection builder.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on concurrently served connections. A permit is acquired before
+/// a connection task is spawned and released when it ends, so a connection
+/// flood cannot exhaust file descriptors, memory, or spawned tasks. Excess
+/// clients wait in the OS accept backlog rather than in our process.
+const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+
+/// How long to pause after an accept failure caused by file-descriptor
+/// exhaustion (`EMFILE`/`ENFILE`), mirroring hyper's historical behavior.
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Hard deadline for draining in-flight connections after a shutdown signal.
+/// Once it elapses `serve` returns so the process can exit even if a connection
+/// refuses to finish.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -47,15 +62,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("inbound per-IP rate limiter is DISABLED (PROVIDARR_INBOUND_ENABLED=false)");
     }
 
-    let api_auth = &state.config.api_auth;
-    if api_auth.enabled && api_auth.api_key.is_empty() {
-        tracing::warn!(
-            "API authentication is ENABLED but no api_key is configured; \
-             authenticated routes are inaccessible and unauthenticated routes are \
-             rejected with 401"
-        );
-    }
-
     spawn_background_tasks(state.clone());
 
     let app = api::router(state);
@@ -71,10 +77,16 @@ async fn main() -> anyhow::Result<()> {
 /// HTTP/1 header-read timeout) are configurable, which `axum::serve` does not
 /// allow.
 ///
+/// Only HTTP/1 is served: deployments sit behind a reverse proxy that speaks
+/// HTTP/1.1 to the backend, and hyper's HTTP/1 builder arms the header-read
+/// timeout against the very first read (whereas the auto builder sniffs for the
+/// HTTP/2 preface first and HTTP/2 has no header/keepalive deadline).
+///
 /// `ConnectInfo<SocketAddr>` is preserved by routing every accepted connection
 /// through `IntoMakeServiceWithConnectInfo` (which implements `Service<SocketAddr>`)
 /// before wrapping the resulting tower service for hyper. Graceful shutdown is
-/// preserved with the same `watch`-channel pattern `axum::serve` uses.
+/// preserved with the same `watch`-channel pattern `axum::serve` uses, plus a
+/// hard drain deadline.
 async fn serve(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -86,17 +98,54 @@ async fn serve(
     // accept loop and each in-flight connection observe as the shutdown signal.
     let (signal_tx, signal_rx) = watch::channel(());
     tokio::spawn(async move {
+        // Wait for the first signal, then trigger graceful shutdown.
         shutdown_signal().await;
         drop(signal_rx);
+
+        // A second signal forces immediate exit rather than waiting out the
+        // drain deadline.
+        shutdown_signal().await;
+        tracing::warn!("second shutdown signal received; forcing immediate exit");
+        std::process::exit(0);
     });
 
     // Held open until every connection task has finished, so we can wait for
     // in-flight requests after the listener stops accepting.
     let (close_tx, close_rx) = watch::channel(());
 
+    // Bounds connections/tasks spawned by the accept loop.
+    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
     loop {
         let (stream, remote_addr) = tokio::select! {
-            conn = listener.accept() => conn?,
+            conn = listener.accept() => match conn {
+                Ok(pair) => pair,
+                Err(err) if is_connection_error(&err) => {
+                    // The peer went away before we accepted it. Ignore and keep
+                    // serving; one bad connection must never stop the server.
+                    tracing::debug!(error = %err, "ignoring transient accept error");
+                    continue;
+                }
+                Err(err) if is_fd_exhaustion(&err) => {
+                    // Too many open files: log, back off, and retry instead of
+                    // aborting the process.
+                    tracing::error!(error = %err, "accept failed (fd exhaustion); backing off");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            },
+            _ = signal_tx.closed() => break,
+        };
+
+        // Acquire a slot before spawning; released when the task ends. If the
+        // semaphore were ever closed this would be fatal, but we never close it.
+        // The shutdown branch prevents waiting on a full semaphore from
+        // deadlocking graceful shutdown.
+        let permit = tokio::select! {
+            permit = Arc::clone(&connections).acquire_owned() => {
+                permit.expect("connection semaphore is never closed")
+            }
             _ = signal_tx.closed() => break,
         };
 
@@ -117,14 +166,12 @@ async fn serve(
         let close_rx = close_rx.clone();
 
         tokio::spawn(async move {
-            let mut builder = AutoBuilder::new(TokioExecutor::new());
+            let mut builder = http1::Builder::new();
             builder
-                .http1()
                 .timer(TokioTimer::new())
                 .header_read_timeout(header_read_timeout);
 
-            let mut conn =
-                std::pin::pin!(builder.serve_connection_with_upgrades(io, hyper_service));
+            let mut conn = std::pin::pin!(builder.serve_connection(io, hyper_service));
             let mut signal_closed = std::pin::pin!(signal_tx.closed());
             let mut shutting_down = false;
 
@@ -144,16 +191,51 @@ async fn serve(
             }
 
             drop(close_rx);
+            drop(permit);
         });
     }
 
     drop(close_rx);
     drop(listener);
 
-    // Wait for all connection tasks to observe the shutdown and drain.
-    close_tx.closed().await;
+    // Wait for all connection tasks to observe the shutdown and drain, but not
+    // forever: a stuck connection must not prevent process exit.
+    if tokio::time::timeout(SHUTDOWN_DEADLINE, close_tx.closed())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            deadline = ?SHUTDOWN_DEADLINE,
+            "shutdown deadline elapsed with connections still open; exiting anyway"
+        );
+    }
 
     Ok(())
+}
+
+/// Returns `true` for accept errors that merely mean the pending connection
+/// vanished before it could be accepted.
+fn is_connection_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Returns `true` when an accept failed because the process ran out of file
+/// descriptors (`EMFILE`) or the system-wide limit was hit (`ENFILE`).
+fn is_fd_exhaustion(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(err.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 fn spawn_background_tasks(state: AppState) {
@@ -228,6 +310,8 @@ fn spawn_background_tasks(state: AppState) {
     });
 }
 
+/// Resolves on the next SIGINT (Ctrl-C) or, on Unix, SIGTERM. Safe to call
+/// repeatedly; each call waits for a fresh signal.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.ok();
