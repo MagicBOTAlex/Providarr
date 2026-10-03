@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -51,10 +53,10 @@ pub fn init(config: &LoggingConfig) -> Option<WorkerGuard> {
         )
         .with(
             fmt::layer()
+                .json()
                 .with_target(true)
                 .with_ansi(false)
-                .with_writer(writer)
-                .compact(),
+                .with_writer(writer),
         )
         .init();
 
@@ -62,7 +64,7 @@ pub fn init(config: &LoggingConfig) -> Option<WorkerGuard> {
 }
 
 fn build_appender(config: &LoggingConfig) -> anyhow::Result<RollingFileAppender> {
-    std::fs::create_dir_all(&config.dir)?;
+    create_log_dir(Path::new(&config.dir))?;
 
     let mut builder = RollingFileAppender::builder()
         .rotation(map_rotation(config.rotation))
@@ -74,6 +76,30 @@ fn build_appender(config: &LoggingConfig) -> anyhow::Result<RollingFileAppender>
     }
 
     Ok(builder.build(&config.dir)?)
+}
+
+/// Creates the log directory and restricts it to the current user on Unix.
+///
+/// Pre-existing directories are not treated as an error and are re-secured to `0o700`.
+fn create_log_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        match builder.create(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
 }
 
 fn map_rotation(rotation: LogRotation) -> Rotation {
