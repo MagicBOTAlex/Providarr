@@ -136,6 +136,21 @@ All settings live in `config/config.json`, overridable with `PROVIDARR_*` enviro
 Providers: `tmdb` (`https://api.themoviedb.org/3`, `TMDB_API_TOKEN`) and `tvdb`
 (`https://api4.thetvdb.com/v4`, `TVDB_API_KEY`, token cached 24h).
 
+## Security
+
+- **Enable API auth in production.** Turn on the shared-secret API key with
+  `PROVIDARR_API_AUTH_ENABLED=true`, provide the secret via `PROVIDARR_API_AUTH_KEY`, and set the
+  header name with `PROVIDARR_API_AUTH_HEADER` (default `x-api-key`). Auth is fail-closed: enabling
+  it without a key is a startup error, so the secret can stay in the environment rather than
+  `config/config.json`.
+- **Limit network exposure.** The service binds to `0.0.0.0` by default. Bind it to loopback or a
+  private network and terminate TLS at a reverse proxy in front of it.
+- **Inbound rate limiting is enabled by default.** A per-client-IP limiter runs alongside a
+  server-wide ceiling and a concurrency cap, so a single instance is not overwhelmed by a flood.
+- **Keep secrets out of the repo.** Provider credentials (`TMDB_API_TOKEN`, `TVDB_API_KEY`) and
+  `DATABASE_URL` are read from environment variables. Do not commit them; `.env` is gitignored and
+  the Docker images are built without secrets.
+
 ## Theoriarr integration
 
 Point Theoriarr at Providarr (a restart is required):
