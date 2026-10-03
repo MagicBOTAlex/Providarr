@@ -17,9 +17,10 @@ Does it work? Yeah (At least for me)
 You have been warned!
 
 I actively use this and I find it better than Sonarr and Radarr. \
-This would not have been possible without Sonarr's and Radarr's open source. \
+But, this would not have been possible without Sonarr's and Radarr's open source. \
 Any donations, please support them and not me. \
 This project is really just their code, but regurgitated.
+Expect tons of bugs!
 
 Everything under here is AI written.
 
