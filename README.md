@@ -30,8 +30,8 @@ A small Rust service that proxies metadata requests to **TMDb** and **TheTVDB**,
 per-provider rate limiting, progressive backoff, and heavy Postgres caching. It serves the
 metadata APIs used by [Theoriarr](https://github.com/MagicBOTAlex/Theoriarr).
 
-> **Aggressive caching and strict rate limits by default.** Cache TTL is 3 days by default
-> (7 days for movie/series metadata, up to 30 days for static reference data) with a 14-day
+> **Aggressive caching and strict rate limits by default.** Cache TTL is 3 months by default
+> (6 months for movie/series metadata and static reference data) with a 30-day
 > stale-if-error window and stale-while-revalidate. Inbound requests are limited per client IP
 > (2 req/s, burst 5) with a server-wide ceiling (100 req/s, burst 200) and a 128 concurrent-request
 > cap. Tune `cache.*` / `inbound.*` / `providers.*` in `config/config.json`; the effective policy is
@@ -125,7 +125,7 @@ later `replay.enabled=true` run (that directory is gitignored).
 All settings live in `config/config.json`, overridable with `PROVIDARR_*` environment variables
 (see [`.env.example`](.env.example)). The main groups:
 
-- `cache` — `default_ttl` (3d), per-resource `endpoint_ttl`, `min_ttl`/`max_ttl`, `negative_ttl` (5m), `not_found_ttl` (1h), `stale_if_error` (14d), `stale_while_revalidate`, `honor_cache_control`, `request_coalescing`.
+- `cache` — `default_ttl` (90d), per-resource `endpoint_ttl` (up to 180d for movie/series/static), `min_ttl`/`max_ttl` (180d), `negative_ttl` (5m), `not_found_ttl` (1h), `stale_if_error` (30d), `stale_while_revalidate`, `honor_cache_control`, `request_coalescing`.
 - `inbound` — `requests_per_second` (2), `burst` (5), `global_requests_per_second` (100), `global_burst` (200), `max_concurrent` (128), `trust_forwarded_for` (false), `trusted_proxies`, `bypass`. Forwarding headers are only honoured from trusted peers, and IPv6 clients are keyed by `/64` prefix.
 - `search` — `hydrate_limit` (5): how many search/list results are hydrated with full details.
 - `providers` — per-provider outbound budget and timeout.

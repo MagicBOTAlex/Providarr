@@ -86,9 +86,9 @@ TVDB ignores `Accept-Language`; English name/overview come from `/translations/e
 **Generic proxy**: `GET /v1/{provider}/{*path}` → cached, rate-limited, authenticated forward of
 TMDb/TVDB (used for arbitrary provider calls and tests).
 
-**Caching** (`src/cache.rs`): Postgres; per-resource TTL policy (`cache.endpoint_ttl`, e.g. 7d
-metadata, 30d static, 1h changes), `min_ttl`/`max_ttl` clamp, `honor_cache_control=false` (our policy
-wins), 14d `stale_if_error`, **stale-while-revalidate**, **single-flight coalescing** (64 shards),
+**Caching** (`src/cache.rs`): Postgres; per-resource TTL policy (`cache.endpoint_ttl`, e.g. 180d
+metadata and static data, 1h changes), `min_ttl`/`max_ttl` clamp, `honor_cache_control=false` (our
+policy wins), 30d `stale_if_error`, **stale-while-revalidate**, **single-flight coalescing** (64 shards),
 negative caching, cumulative hits. Confirmed live: 5 concurrent cold requests → 1 upstream call;
 TTL expiry re-fetches.
 

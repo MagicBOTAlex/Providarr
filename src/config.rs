@@ -410,19 +410,21 @@ impl CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         let day: u64 = 24 * 60 * 60;
-        let long: u64 = 30 * day;
+        let month: u64 = 30 * day;
+        // Metadata and static reference data are cached for ~6 months.
+        let long: u64 = 6 * month;
         let mut endpoint_ttl = HashMap::new();
         for (key, secs) in [
-            ("movie", 7 * day),
-            ("movies", 7 * day),
-            ("tv", 7 * day),
-            ("series", 7 * day),
-            ("collection", 7 * day),
-            ("find", 7 * day),
-            ("people", 7 * day),
-            ("person", 7 * day),
-            ("companies", 7 * day),
-            ("networks", 7 * day),
+            ("movie", long),
+            ("movies", long),
+            ("tv", long),
+            ("series", long),
+            ("collection", long),
+            ("find", long),
+            ("people", long),
+            ("person", long),
+            ("companies", long),
+            ("networks", long),
             ("search", day),
             ("list", day),
             ("trending", day),
@@ -461,12 +463,12 @@ impl Default for CacheConfig {
 
         Self {
             enabled: true,
-            default_ttl: Duration::from_secs(3 * day),
+            default_ttl: Duration::from_secs(3 * month),
             max_ttl: Duration::from_secs(long),
             min_ttl: Duration::from_secs(60 * 60),
             negative_ttl: Duration::from_secs(5 * 60),
             not_found_ttl: Duration::from_secs(60 * 60),
-            stale_if_error: Duration::from_secs(14 * day),
+            stale_if_error: Duration::from_secs(30 * day),
             negative_stale_if_error: Duration::from_secs(10 * 60),
             honor_cache_control: false,
             request_coalescing: true,
@@ -719,11 +721,12 @@ mod tests {
     fn endpoint_ttl_policy_is_long_for_metadata_and_huge_for_static() {
         let config = CacheConfig::default();
         let day = Duration::from_secs(24 * 60 * 60);
+        let half_year = 6 * 30 * day;
         let hour = Duration::from_secs(60 * 60);
 
-        assert_eq!(config.ttl_for_path("/movie/535167"), 7 * day);
-        assert_eq!(config.ttl_for_path("/series/239951/extended"), 7 * day);
-        assert_eq!(config.ttl_for_path("/tv/1399"), 7 * day);
+        assert_eq!(config.ttl_for_path("/movie/535167"), half_year);
+        assert_eq!(config.ttl_for_path("/series/239951/extended"), half_year);
+        assert_eq!(config.ttl_for_path("/tv/1399"), half_year);
         assert_eq!(config.ttl_for_path("/search/movie"), day);
         assert_eq!(config.ttl_for_path("/configuration"), config.max_ttl);
 
