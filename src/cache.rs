@@ -14,6 +14,15 @@ use sqlx::{PgPool, Row};
 
 use crate::{config::CacheConfig, error::AppError};
 
+/// Hard upper bound on the number of rows kept in `cache_entries`. TTLs can be
+/// up to six months and the hourly purge only removes rows past their stale
+/// window, so an explicit budget is required to keep the table from growing
+/// without limit. Eviction is enforced on the write path (see `put`).
+const MAX_ENTRIES: i64 = 200_000;
+
+/// Hard upper bound on the total body bytes kept in `cache_entries`.
+const MAX_TOTAL_BYTES: i64 = 8 * 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct CachedEntry {
     pub status_code: u16,
@@ -104,20 +113,38 @@ impl CacheStore {
     /// Returns the entry regardless of freshness (caller decides fresh/stale).
     /// Fresh lookups bump the hit counter.
     pub async fn get(&self, key: &str) -> Result<Option<CachedEntry>, AppError> {
+        // Plain read: takes no row write lock and returns the pool connection as
+        // soon as the row is fetched. Oversized (pre-existing) rows are skipped
+        // so a body above `max_body_bytes` can never be returned.
         let row = sqlx::query(
-            "UPDATE cache_entries SET hits = hits + 1, last_accessed_at = now() \
-             WHERE cache_key = $1 \
-             RETURNING status_code, content_type, body, headers, created_at, expires_at",
+            "SELECT status_code, content_type, body, headers, created_at, expires_at \
+             FROM cache_entries \
+             WHERE cache_key = $1 AND octet_length(body) <= $2",
         )
         .bind(key)
+        .bind(self.config.max_body_bytes as i64)
         .fetch_optional(&self.pool)
         .await?;
 
-        if row.is_some() {
-            self.counters.total_hits.fetch_add(1, Ordering::Relaxed);
-        }
+        let Some(row) = row else {
+            return Ok(None);
+        };
 
-        Ok(row.map(|row| CachedEntry {
+        // Hit accounting is best-effort and decoupled from the read: a failure
+        // to record the hit must never fail the lookup.
+        if let Err(e) = sqlx::query(
+            "UPDATE cache_entries SET hits = hits + 1, last_accessed_at = now() \
+             WHERE cache_key = $1",
+        )
+        .bind(key)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::debug!(cache_key = key, error = %e, "failed to record cache hit");
+        }
+        self.counters.total_hits.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Some(CachedEntry {
             status_code: row.get::<i32, _>("status_code").max(0) as u16,
             content_type: row.get::<Option<String>, _>("content_type"),
             body: Bytes::from(row.get::<Vec<u8>, _>("body")),
@@ -209,6 +236,65 @@ impl CacheStore {
                     .approx_bytes
                     .fetch_add(new_len - old_len, Ordering::Relaxed);
             }
+        }
+
+        // Best-effort: never fail a request because a budget sweep errored.
+        if let Err(e) = self.enforce_budget().await {
+            tracing::warn!(
+                provider,
+                endpoint,
+                error = %e,
+                "cache budget enforcement failed; table may exceed caps until next write"
+            );
+        }
+        Ok(())
+    }
+
+    /// Evicts oldest rows when the in-memory counters exceed the hard caps.
+    /// Runs only when a cap is crossed, so the steady state stays on the fast
+    /// path. Retains the most recently accessed rows within both budgets.
+    async fn enforce_budget(&self) -> Result<(), sqlx::Error> {
+        let entries = self.counters.entries.load(Ordering::Relaxed);
+        let bytes = self.counters.approx_bytes.load(Ordering::Relaxed);
+        if entries <= MAX_ENTRIES && bytes <= MAX_TOTAL_BYTES {
+            return Ok(());
+        }
+
+        let removed: Vec<i64> = sqlx::query_scalar(
+            "WITH ranked AS ( \
+               SELECT cache_key, \
+                      ROW_NUMBER() OVER ( \
+                        ORDER BY last_accessed_at DESC NULLS LAST, cache_key DESC \
+                      ) AS rn, \
+                      SUM(octet_length(body)) OVER ( \
+                        ORDER BY last_accessed_at DESC NULLS LAST, cache_key DESC \
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                      ) AS running_bytes \
+               FROM cache_entries \
+             ) \
+             DELETE FROM cache_entries \
+             WHERE cache_key IN ( \
+               SELECT cache_key FROM ranked WHERE rn > $1 OR running_bytes > $2 \
+             ) \
+             RETURNING octet_length(body)::bigint",
+        )
+        .bind(MAX_ENTRIES)
+        .bind(MAX_TOTAL_BYTES)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let rows = removed.len() as i64;
+        if rows > 0 {
+            let byte_total: i64 = removed.iter().sum();
+            self.counters.entries.fetch_sub(rows, Ordering::Relaxed);
+            self.counters
+                .approx_bytes
+                .fetch_sub(byte_total, Ordering::Relaxed);
+            tracing::info!(
+                evicted_entries = rows,
+                evicted_bytes = byte_total,
+                "cache budget exceeded; evicted oldest entries"
+            );
         }
         Ok(())
     }
