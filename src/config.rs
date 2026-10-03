@@ -860,7 +860,7 @@ pub struct InboundLimiterConfig {
 impl Default for InboundLimiterConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             requests_per_second: 2.0,
             burst: 5,
             global_requests_per_second: 100.0,
