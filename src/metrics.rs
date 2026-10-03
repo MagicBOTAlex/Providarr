@@ -1,7 +1,44 @@
+use std::collections::HashSet;
+
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
+use parking_lot::Mutex;
 
 static HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
+
+/// Upper bound on the number of distinct label values tracked per label. The
+/// Prometheus recorder keeps a permanent series per distinct label value, so
+/// attacker-influenced values (e.g. request paths) must be bounded to prevent
+/// unbounded memory growth. Values beyond the cap collapse into `OTHER_LABEL`.
+const MAX_LABEL_VALUES: usize = 2000;
+const OTHER_LABEL: &str = "{other}";
+
+static ENDPOINTS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+static PROVIDERS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn bound_label(value: &str, seen: &Mutex<HashSet<String>>) -> String {
+    let mut slots = seen.lock();
+    if slots.contains(value) {
+        return value.to_string();
+    }
+    if slots.len() >= MAX_LABEL_VALUES {
+        return OTHER_LABEL.to_string();
+    }
+    slots.insert(value.to_string());
+    value.to_string()
+}
+
+/// Returns a bounded label value for an endpoint, remapping values beyond the
+/// cardinality cap to `"{other}"`.
+fn bound_endpoint(endpoint: &str) -> String {
+    bound_label(endpoint, &ENDPOINTS)
+}
+
+/// Returns a bounded label value for a provider, remapping values beyond the
+/// cardinality cap to `"{other}"`.
+fn bound_provider(provider: &str) -> String {
+    bound_label(provider, &PROVIDERS)
+}
 
 /// Installs the Prometheus recorder once per process and returns a handle that
 /// can render the current metric snapshot.
@@ -90,8 +127,8 @@ fn describe() {
 pub fn request(provider: &str, endpoint: &str, status: u16) {
     metrics::counter!(
         "providarr_requests_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string(),
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint),
         "status" => status.to_string()
     )
     .increment(1);
@@ -100,8 +137,8 @@ pub fn request(provider: &str, endpoint: &str, status: u16) {
 pub fn rate_limited(provider: &str, endpoint: &str) {
     metrics::counter!(
         "providarr_rate_limited_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .increment(1);
 }
@@ -109,8 +146,8 @@ pub fn rate_limited(provider: &str, endpoint: &str) {
 pub fn cache_hit(provider: &str, endpoint: &str) {
     metrics::counter!(
         "providarr_cache_hits_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .increment(1);
 }
@@ -118,8 +155,8 @@ pub fn cache_hit(provider: &str, endpoint: &str) {
 pub fn cache_miss(provider: &str, endpoint: &str) {
     metrics::counter!(
         "providarr_cache_misses_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .increment(1);
 }
@@ -127,8 +164,8 @@ pub fn cache_miss(provider: &str, endpoint: &str) {
 pub fn cache_stale(provider: &str, endpoint: &str) {
     metrics::counter!(
         "providarr_cache_stale_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .increment(1);
 }
@@ -136,8 +173,8 @@ pub fn cache_stale(provider: &str, endpoint: &str) {
 pub fn cache_oversized(provider: &str, endpoint: &str) {
     metrics::counter!(
         "providarr_cache_oversized_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .increment(1);
 }
@@ -145,8 +182,8 @@ pub fn cache_oversized(provider: &str, endpoint: &str) {
 pub fn dropped(provider: &str, endpoint: &str) {
     metrics::counter!(
         "providarr_dropped_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .increment(1);
 }
@@ -154,8 +191,8 @@ pub fn dropped(provider: &str, endpoint: &str) {
 pub fn upstream_error(provider: &str, endpoint: &str) {
     metrics::counter!(
         "providarr_upstream_errors_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .increment(1);
 }
@@ -163,8 +200,8 @@ pub fn upstream_error(provider: &str, endpoint: &str) {
 pub fn backoff_seconds(provider: &str, endpoint: &str, seconds: f64) {
     metrics::gauge!(
         "providarr_backoff_seconds",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .set(seconds);
 }
@@ -172,8 +209,8 @@ pub fn backoff_seconds(provider: &str, endpoint: &str, seconds: f64) {
 pub fn replayed(provider: &str, endpoint: &str) {
     metrics::counter!(
         "providarr_replay_total",
-        "provider" => provider.to_string(),
-        "endpoint" => endpoint.to_string()
+        "provider" => bound_provider(provider),
+        "endpoint" => bound_endpoint(endpoint)
     )
     .increment(1);
 }
@@ -181,7 +218,7 @@ pub fn replayed(provider: &str, endpoint: &str) {
 pub fn replay_miss(provider: &str) {
     metrics::counter!(
         "providarr_replay_miss_total",
-        "provider" => provider.to_string()
+        "provider" => bound_provider(provider)
     )
     .increment(1);
 }
