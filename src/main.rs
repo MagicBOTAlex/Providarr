@@ -1,11 +1,24 @@
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto::Builder as AutoBuilder,
+    service::TowerToHyperService,
+};
 use providarr::{api, config::AppConfig, state::AppState, telemetry};
+use tokio::sync::watch;
+use tower::{Service as _, ServiceExt as _};
 
 /// Retention window for the append-only accounting tables. Rows older than this
 /// are pruned by the hourly maintenance task. Kept as a constant rather than a
 /// config field so the bound cannot be accidentally disabled in deployment.
 const RETENTION_WINDOW: Duration = Duration::from_secs(60 * 60 * 24 * 30);
+
+/// Maximum time a client may take to transmit its request headers. Bounds
+/// slowloris-style clients that trickle headers to hold connections open. axum's
+/// `serve` is intentionally unconfigurable, so the server runs a custom hyper
+/// accept loop that can set this on the connection builder.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,12 +62,96 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!(%address, "Providarr listening");
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    serve(listener, app, HEADER_READ_TIMEOUT).await?;
+
+    Ok(())
+}
+
+/// Runs a custom hyper accept loop so connection-level knobs (notably the
+/// HTTP/1 header-read timeout) are configurable, which `axum::serve` does not
+/// allow.
+///
+/// `ConnectInfo<SocketAddr>` is preserved by routing every accepted connection
+/// through `IntoMakeServiceWithConnectInfo` (which implements `Service<SocketAddr>`)
+/// before wrapping the resulting tower service for hyper. Graceful shutdown is
+/// preserved with the same `watch`-channel pattern `axum::serve` uses.
+async fn serve(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    header_read_timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    // Dropping the receiver makes every `Sender::closed()` resolve, which the
+    // accept loop and each in-flight connection observe as the shutdown signal.
+    let (signal_tx, signal_rx) = watch::channel(());
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        drop(signal_rx);
+    });
+
+    // Held open until every connection task has finished, so we can wait for
+    // in-flight requests after the listener stops accepting.
+    let (close_tx, close_rx) = watch::channel(());
+
+    loop {
+        let (stream, remote_addr) = tokio::select! {
+            conn = listener.accept() => conn?,
+            _ = signal_tx.closed() => break,
+        };
+
+        let io = TokioIo::new(stream);
+
+        let tower_service = make_service
+            .call(remote_addr)
+            .await
+            .map(|service| {
+                service.map_request(|request: axum::extract::Request<hyper::body::Incoming>| {
+                    request.map(axum::body::Body::new)
+                })
+            })
+            .unwrap_or_else(|err| match err {});
+
+        let hyper_service = TowerToHyperService::new(tower_service);
+        let signal_tx = signal_tx.clone();
+        let close_rx = close_rx.clone();
+
+        tokio::spawn(async move {
+            let mut builder = AutoBuilder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_read_timeout);
+
+            let mut conn =
+                std::pin::pin!(builder.serve_connection_with_upgrades(io, hyper_service));
+            let mut signal_closed = std::pin::pin!(signal_tx.closed());
+            let mut shutting_down = false;
+
+            loop {
+                tokio::select! {
+                    result = conn.as_mut() => {
+                        if let Err(err) = result {
+                            tracing::debug!(error = %err, "connection closed with error");
+                        }
+                        break;
+                    }
+                    _ = &mut signal_closed, if !shutting_down => {
+                        shutting_down = true;
+                        conn.as_mut().graceful_shutdown();
+                    }
+                }
+            }
+
+            drop(close_rx);
+        });
+    }
+
+    drop(close_rx);
+    drop(listener);
+
+    // Wait for all connection tasks to observe the shutdown and drain.
+    close_tx.closed().await;
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -13,15 +13,28 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
+use once_cell::sync::Lazy;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::{
-    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
-    trace::TraceLayer,
+    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::RequestBodyTimeoutLayer,
+    timeout::TimeoutLayer, trace::TraceLayer,
 };
 
 use crate::{error::AppError, inbound::InboundLimiter, state::AppState};
+
+/// TTL for the cached `/health` database probe. `/health` is unauthenticated, so
+/// without this a flood of health checks would each acquire a pooled connection
+/// and could starve the (default 10-connection) pool.
+const HEALTH_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Last observed database health as `(checked_at, healthy)`. The async mutex is
+/// held across the probe so a cache expiry under load triggers a single DB
+/// round-trip rather than a thundering herd.
+static HEALTH_CACHE: Lazy<AsyncMutex<Option<(Instant, bool)>>> =
+    Lazy::new(|| AsyncMutex::new(None));
 
 pub fn router(state: AppState) -> Router {
     let request_timeout = state.config.server.request_timeout;
@@ -79,11 +92,17 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             inbound_middleware,
         ))
+        // Outermost so any request-body read, at any layer, is bounded even if
+        // the client trickles bytes for the whole body (slow-body / Slowloris).
+        .layer(RequestBodyTimeoutLayer::new(request_timeout))
         .with_state(state)
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    crate::db::ping(&state.pool).await?;
+    if !cached_db_health(&state).await {
+        return Err(AppError::Internal("database probe failed".to_string()));
+    }
+
     let providers = state
         .registry
         .names()
@@ -107,6 +126,24 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         "inbound_limiter_enabled": state.inbound.enabled(),
         "providers": providers,
     })))
+}
+
+/// Reports database health, reusing a probe result for up to [`HEALTH_CACHE_TTL`].
+///
+/// A failed probe is cached too, so an outage does not let `/health` floods keep
+/// hammering a saturated pool; the next request after the TTL re-probes.
+async fn cached_db_health(state: &AppState) -> bool {
+    let mut cache = HEALTH_CACHE.lock().await;
+
+    if let Some((checked_at, healthy)) = *cache
+        && checked_at.elapsed() < HEALTH_CACHE_TTL
+    {
+        return healthy;
+    }
+
+    let healthy = crate::db::ping(&state.pool).await.is_ok();
+    *cache = Some((Instant::now(), healthy));
+    healthy
 }
 
 /// Public disclosure of the effective cache policy and rate limits, so clients
@@ -282,14 +319,8 @@ async fn proxy(
         "miss"
     };
 
-    let is_json = response
-        .content_type
-        .as_deref()
-        .is_some_and(|content_type| {
-            content_type
-                .to_ascii_lowercase()
-                .contains("application/json")
-        });
+    let upstream_content_type = response.content_type.as_deref();
+    let is_json = upstream_content_type.is_some_and(is_json_content_type);
 
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY))
@@ -305,13 +336,48 @@ async fn proxy(
         builder = builder.header("x-providarr-replay", "true");
     }
 
-    if let Some(content_type) = response.content_type {
-        builder = builder.header(header::CONTENT_TYPE, content_type);
-    }
+    // Only forward content types on the allowlist. Anything else (notably
+    // `text/html`, `application/xhtml+xml`, `image/svg+xml`) is coerced to JSON
+    // so a misbehaving or compromised provider cannot get active content
+    // rendered on this origin. `nosniff` backs this up.
+    let content_type = match upstream_content_type {
+        Some(content_type) if is_safe_content_type(content_type) => content_type,
+        _ => "application/json",
+    };
+    builder = builder.header(header::CONTENT_TYPE, content_type);
 
     builder
         .body(axum::body::Body::from(response.body))
         .map_err(|err| AppError::Internal(err.to_string()))
+}
+
+/// Content types that are safe to forward to clients verbatim. Everything else
+/// is coerced to `application/json` by [`proxy`].
+fn is_safe_content_type(content_type: &str) -> bool {
+    let value = content_type.trim().to_ascii_lowercase();
+
+    // `image/svg+xml` is active content (it can carry scripts), so it is not
+    // treated as a safe image despite the `image/` prefix.
+    if value.starts_with("image/svg") {
+        return false;
+    }
+
+    value.starts_with("application/json")
+        || starts_with_application_json_suffix(&value)
+        || value.starts_with("text/plain")
+        || value.starts_with("image/")
+        || value.starts_with("application/octet-stream")
+}
+
+/// True for the `application/<subtype>+json` structured-suffix family.
+fn starts_with_application_json_suffix(value: &str) -> bool {
+    value.starts_with("application/") && value.contains("+json")
+}
+
+/// True when a content type denotes JSON (used to decide `Content-Disposition`).
+fn is_json_content_type(content_type: &str) -> bool {
+    let value = content_type.trim().to_ascii_lowercase();
+    value.starts_with("application/json") || starts_with_application_json_suffix(&value)
 }
 
 async fn radarr_movie(

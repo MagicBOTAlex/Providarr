@@ -1748,6 +1748,7 @@ dependencies = [
  "http-body-util",
  "humantime-serde",
  "hyper",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
  "once_cell",
