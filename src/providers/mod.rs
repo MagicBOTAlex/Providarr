@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use futures::StreamExt;
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
@@ -637,7 +636,7 @@ fn entry_to_response(entry: CachedEntry, stale: bool) -> ProviderResponse {
 /// oversized body before any of it is read; the streamed body is then counted
 /// chunk by chunk so a missing/lying length or a decompression bomb is still
 /// capped. Excessively large bodies surface as `AppError::Upstream`.
-async fn read_body_capped(response: reqwest::Response, max: usize) -> Result<Bytes, AppError> {
+async fn read_body_capped(mut response: reqwest::Response, max: usize) -> Result<Bytes, AppError> {
     let status = response.status().as_u16();
     if let Some(len) = response.content_length()
         && len > max as u64
@@ -648,11 +647,11 @@ async fn read_body_capped(response: reqwest::Response, max: usize) -> Result<Byt
         });
     }
 
-    let mut stream = response.bytes_stream();
     let mut body = BytesMut::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
             Err(err) if err.is_timeout() => return Err(AppError::Timeout),
             Err(err) => return Err(AppError::Http(err)),
         };

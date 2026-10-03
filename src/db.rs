@@ -237,24 +237,24 @@ pub async fn load_rate_limit_events(
     // `rate_limit_events_provider_idx (provider, occurred_at DESC)`. A single
     // `($1 IS NULL OR provider = $1)` predicate is not sargable and would force
     // a full scan plus sort.
-    const COLUMNS: &str =
-        "provider, endpoint, occurred_at, requests_since_last_limit, status_code, detail";
     let rows = match provider {
         Some(provider) => {
-            sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM rate_limit_events \
+            sqlx::query(
+                "SELECT provider, endpoint, occurred_at, requests_since_last_limit, status_code, detail \
+                 FROM rate_limit_events \
                  WHERE provider = $1 ORDER BY occurred_at DESC LIMIT $2",
-            ))
+            )
             .bind(provider)
             .bind(limit)
             .fetch_all(pool)
             .await?
         }
         None => {
-            sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM rate_limit_events \
+            sqlx::query(
+                "SELECT provider, endpoint, occurred_at, requests_since_last_limit, status_code, detail \
+                 FROM rate_limit_events \
                  ORDER BY occurred_at DESC LIMIT $1",
-            ))
+            )
             .bind(limit)
             .fetch_all(pool)
             .await?
