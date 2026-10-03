@@ -5,6 +5,25 @@ use std::time::Duration;
 use common::*;
 use providarr::cache::CacheStore;
 
+/// Hit accounting is applied by a detached write, so tests must wait for it to
+/// settle rather than reading the counter immediately after `get`.
+async fn wait_for_hits(store: &CacheStore, key: &str, expected: i64) {
+    let mut last = i64::MIN;
+    for _ in 0..250 {
+        let row = sqlx::query("SELECT hits FROM cache_entries WHERE cache_key = $1")
+            .bind(key)
+            .fetch_one(store.pool())
+            .await
+            .expect("read hits");
+        last = sqlx::Row::get::<i64, _>(&row, "hits");
+        if last == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("hits did not settle to {expected} (last = {last})");
+}
+
 #[tokio::test]
 async fn cache_put_get_and_hits() {
     let pool = test_pool().await;
@@ -35,14 +54,9 @@ async fn cache_put_get_and_hits() {
     assert_eq!(&entry.body[..], b"{\"id\":1}");
     assert!(entry.is_fresh(chrono::Utc::now()));
 
-    // second read bumps hit counter
+    // second read bumps hit counter (applied asynchronously)
     let _ = store.get(&key).await.unwrap().unwrap();
-    let row = sqlx::query("SELECT hits FROM cache_entries WHERE cache_key = $1")
-        .bind(&key)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-    assert_eq!(sqlx::Row::get::<i64, _>(&row, "hits"), 2);
+    wait_for_hits(&store, &key, 2).await;
 
     let stats = store.stats().await.unwrap();
     assert!(stats.entries >= 1);
@@ -126,16 +140,7 @@ async fn hits_accumulate_across_refresh() {
         .unwrap(); // refresh while still valid
     let _ = store.get(&key).await.unwrap().unwrap();
 
-    let row = sqlx::query("SELECT hits FROM cache_entries WHERE cache_key = $1")
-        .bind(&key)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        sqlx::Row::get::<i64, _>(&row, "hits"),
-        2,
-        "a refresh must not reset cumulative hits"
-    );
+    wait_for_hits(&store, &key, 2).await;
 }
 
 #[tokio::test]
