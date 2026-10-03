@@ -10,17 +10,40 @@ use crate::{config::AuthConfig, error::AppError, ratelimit::limiter::ProviderRun
 const MAX_LOGIN_BODY_BYTES: usize = 64 * 1024;
 
 /// The credentials to attach to an upstream request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ResolvedAuth {
     None,
     Bearer(String),
     Query { param: String, value: String },
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for ResolvedAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolvedAuth::None => f.write_str("None"),
+            ResolvedAuth::Bearer(_) => f.write_str("Bearer(\"<redacted>\")"),
+            ResolvedAuth::Query { param, .. } => f
+                .debug_struct("Query")
+                .field("param", param)
+                .field("value", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct CachedToken {
     token: String,
     expires_at: Instant,
+}
+
+impl std::fmt::Debug for CachedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Resolves and caches credentials for a provider.
