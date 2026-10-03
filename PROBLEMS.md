@@ -26,3 +26,8 @@
   so Theoriarr's `tvRageId` stays null. A `remote("TVRage")` lookup is not worth adding; accepted.
 - **TVDB login token is cached in memory for 24h.** On restart it re-logs in. Fine for now; consider
   persisting or honouring the token's real expiry.
+- **Cache and accounting windows are fixed.** Cache entries expire per the configured `cache.*` TTLs
+  and stale windows, and the per-IP inbound limiter evicts idle buckets and caps tracked IPs
+  (`max_tracked_ips`). Tune these for the expected traffic of your deployment.
+- **Rate-limit history is append-only.** `rate_limit_events` (read by `/v1/ratelimits/history`) has
+  no automatic time-based retention; prune it externally if the table grows large.

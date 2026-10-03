@@ -151,6 +151,7 @@ settings, `services.sonarr.tv` decoupling, enrichment, and scale-out (see `Near 
 
 - [ ] TVDB `/updates` delta sync + a local mirror database.
 - [ ] Multi-instance safe rate limiting (shared Postgres/Redis limiter).
+- [ ] Retention/pruning job for `rate_limit_events` history.
 - [ ] Self-hosted OAuth broker integration (Trakt/Simkl/AniList).
 - [ ] Admin UI/dashboard; cache-latency and per-endpoint p95 metrics.
 - [ ] Fully retire the fixture path once the real mapper + cutover land.
