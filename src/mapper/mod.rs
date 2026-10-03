@@ -12,6 +12,10 @@ pub mod series;
 const TMDB_IMAGE_BASE: &str = "https://image.tmdb.org/t/p/original";
 const APPEND: &str = "credits,images,external_ids,release_dates,alternative_titles,translations,collection,videos,recommendations,keywords";
 
+/// Upper bound on `/movie/changes` pages fetched in a single call. TMDb allows
+/// far more, but the mapper only needs a bounded sample to stay responsive.
+const MAX_CHANGE_PAGES: i64 = 20;
+
 // ---------------------------------------------------------------------------
 // Output resources (Radarr shape)
 // ---------------------------------------------------------------------------
@@ -379,6 +383,11 @@ pub async fn movie_by_imdb(
     state: &AppState,
     imdb_id: &str,
 ) -> Result<Vec<MovieResource>, AppError> {
+    // Reject anything that is not a canonical IMDb id before interpolating it
+    // into the provider path (`tt` followed by one or more ASCII digits).
+    if !is_valid_imdb_id(imdb_id) {
+        return Err(AppError::NotFound);
+    }
     let path = format!("/find/{imdb_id}?external_source=imdb_id");
     let found: TmdbFind = fetch_json(state, "tmdb", &path).await?;
     let mut out = Vec::new();
@@ -396,7 +405,7 @@ pub async fn search(
     let encoded = encode_query_value(query);
     let mut path = format!("/search/movie?language=en-US&include_adult=false&query={encoded}");
     if let Some(year) = year
-        && !year.is_empty()
+        && is_valid_year(year)
     {
         path.push_str(&format!("&year={year}"));
     }
@@ -458,9 +467,9 @@ pub async fn changed_movies(state: &AppState, since: Option<&str>) -> Result<Vec
         let empty = page.results.is_empty();
         ids.extend(page.results.into_iter().map(|change| change.id));
 
-        // TMDb caps at 500 pages; stop on the last page, an empty page, or when
-        // the response omits pagination metadata entirely.
-        if empty || total <= 0 || current >= total || page_number >= 500 {
+        // Stop on the last page, an empty page, when the response omits
+        // pagination metadata entirely, or once our own page budget is spent.
+        if empty || total <= 0 || current >= total || page_number >= MAX_CHANGE_PAGES {
             break;
         }
         page_number += 1;
@@ -487,6 +496,20 @@ fn parse_since(value: &str) -> Option<chrono::NaiveDate> {
 fn encode_query_value(value: &str) -> String {
     let normalized = value.replace('+', " ");
     url::form_urlencoded::byte_serialize(normalized.as_bytes()).collect()
+}
+
+/// A canonical IMDb id: `tt` followed by one or more ASCII digits. Request
+/// values are percent-decoded upstream, so reject anything with path/query
+/// metacharacters before it reaches the provider path.
+fn is_valid_imdb_id(value: &str) -> bool {
+    value
+        .strip_prefix("tt")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A search `year` is only usable when it is exactly four ASCII digits.
+fn is_valid_year(value: &str) -> bool {
+    value.len() == 4 && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[derive(Debug, Deserialize)]
@@ -880,6 +903,27 @@ mod tests {
         // A pre-encoded `+` must not survive as a literal `%2B`.
         assert_eq!(encode_query_value("Synthetic+Feature"), "Synthetic+Feature");
         assert_eq!(encode_query_value("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn validates_imdb_ids() {
+        assert!(is_valid_imdb_id("tt0000001"));
+        assert!(is_valid_imdb_id("tt1"));
+        assert!(!is_valid_imdb_id("tt"));
+        assert!(!is_valid_imdb_id("0000001"));
+        assert!(!is_valid_imdb_id("tt12ab"));
+        assert!(!is_valid_imdb_id("tt1/../../evil?x=1"));
+        assert!(!is_valid_imdb_id("tt1%2F.."));
+    }
+
+    #[test]
+    fn validates_search_year() {
+        assert!(is_valid_year("2020"));
+        assert!(!is_valid_year(""));
+        assert!(!is_valid_year("20"));
+        assert!(!is_valid_year("20200"));
+        assert!(!is_valid_year("202a"));
+        assert!(!is_valid_year("2020&x=1"));
     }
 
     #[test]
