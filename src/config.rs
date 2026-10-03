@@ -301,16 +301,22 @@ impl AppConfig {
                 "inbound rate limiting is disabled; requests are not throttled (set PROVIDARR_INBOUND_ENABLED=true to enable)"
             );
         }
-        if !inbound.requests_per_second.is_finite() || inbound.requests_per_second < 0.0 {
+        if invalid_requests_per_second(inbound.requests_per_second) {
             return Err(AppError::Config(
-                "inbound.requests_per_second must be a finite number >= 0".into(),
+                "inbound.requests_per_second must be a finite number >= 0 (or >= 1e-6)".into(),
             ));
         }
-        if !inbound.global_requests_per_second.is_finite()
-            || inbound.global_requests_per_second < 0.0
-        {
+        if invalid_requests_per_second(inbound.global_requests_per_second) {
             return Err(AppError::Config(
-                "inbound.global_requests_per_second must be a finite number >= 0".into(),
+                "inbound.global_requests_per_second must be a finite number >= 0 (or >= 1e-6)"
+                    .into(),
+            ));
+        }
+        if inbound.enabled && inbound.requests_per_second == 0.0 {
+            return Err(AppError::Config(
+                "inbound.requests_per_second must be > 0 when the inbound limiter is enabled \
+                 (set inbound.enabled=false for no per-IP limit)"
+                    .into(),
             ));
         }
         if inbound.global_requests_per_second > 0.0 && inbound.global_burst == 0 {
