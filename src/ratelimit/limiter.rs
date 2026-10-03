@@ -59,6 +59,12 @@ impl ProviderRuntime {
             .connect_timeout(config.connect_timeout)
             .pool_idle_timeout(Duration::from_secs(30))
             .user_agent(concat!("Providarr/", env!("CARGO_PKG_VERSION")))
+            // Never follow redirects: an upstream (or an attacker who controls
+            // one) must not be able to bounce us to internal hosts (SSRF).
+            .redirect(reqwest::redirect::Policy::none())
+            // Ignore ambient proxy env vars so they cannot redirect egress
+            // without an explicit, reviewed configuration change.
+            .no_proxy()
             .build()
             .map_err(AppError::Http)?;
 
@@ -235,7 +241,12 @@ fn quota_for_rps(requests_per_second: f64, burst: u32) -> Quota {
             .expect("non-zero period")
             .allow_burst(NonZeroU32::new(u32::MAX).unwrap());
     }
-    let period = Duration::from_secs_f64((1.0 / requests_per_second).max(1e-9));
+    // `1 / rps` can overflow a `Duration` (or be non-finite) for very small
+    // positive rates, and `Duration::from_secs_f64` would panic. Clamp to a
+    // sane range and fall back to a one-second period if conversion fails; we
+    // must never panic on user-supplied config.
+    let secs = (1.0 / requests_per_second).clamp(1e-9, 86_400.0);
+    let period = Duration::try_from_secs_f64(secs).unwrap_or(Duration::from_secs(1));
     Quota::with_period(period)
         .expect("period is non-zero")
         .allow_burst(burst)
@@ -261,6 +272,20 @@ mod tests {
         assert_eq!(endpoint_burst(0.5, 40), 1);
         assert_eq!(endpoint_burst(10.0, 40), 10);
         assert_eq!(endpoint_burst(100.0, 40), 40);
+    }
+
+    #[test]
+    fn quota_for_rps_never_panics_for_extreme_rates() {
+        // Very small positive rates previously overflowed `Duration::from_secs_f64`.
+        let _ = quota_for_rps(f64::MIN_POSITIVE, 1);
+        let _ = quota_for_rps(1e-300, 5);
+        // Very large rates and non-finite inputs must also be handled.
+        let _ = quota_for_rps(f64::MAX, 1);
+        let _ = quota_for_rps(f64::INFINITY, 1);
+        let _ = quota_for_rps(f64::NAN, 1);
+        // `<= 0.0` stays on the effectively-unlimited path.
+        let _ = quota_for_rps(0.0, 1);
+        let _ = quota_for_rps(-1.0, 1);
     }
 
     #[tokio::test]

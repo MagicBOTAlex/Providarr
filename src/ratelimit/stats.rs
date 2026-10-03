@@ -10,6 +10,11 @@ use serde::Serialize;
 
 type Key = (String, String);
 
+/// Hard cap on distinct `(provider, endpoint)` entries. Endpoints are mostly
+/// bounded by the provider's route templates, but a caller can pass arbitrary
+/// strings, so this prevents unbounded memory growth (cardinality DoS).
+const MAX_ENTRIES: usize = 10_000;
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -84,7 +89,32 @@ impl StatsRegistry {
         (provider.to_string(), endpoint.to_string())
     }
 
+    /// Bounds the map size before inserting a new key. Existing keys are never
+    /// evicted here (they are already counted); only arbitrary entries are
+    /// removed to make room. Keys are collected before removal so no DashMap
+    /// references are held across mutation.
+    fn evict_if_full(&self, provider: &str, endpoint: &str) {
+        if self.map.len() < MAX_ENTRIES {
+            return;
+        }
+        let key = Self::key(provider, endpoint);
+        if self.map.contains_key(&key) {
+            return;
+        }
+        let to_remove = self.map.len().saturating_sub(MAX_ENTRIES) + 1;
+        let keys: Vec<Key> = self
+            .map
+            .iter()
+            .take(to_remove)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            self.map.remove(&key);
+        }
+    }
+
     pub fn record_request(&self, provider: &str, endpoint: &str, noted_limit: Option<&str>) {
+        self.evict_if_full(provider, endpoint);
         let entry = self
             .map
             .entry(Self::key(provider, endpoint))
@@ -110,6 +140,7 @@ impl StatsRegistry {
     }
 
     pub fn record_success(&self, provider: &str, endpoint: &str, status: u16) {
+        self.evict_if_full(provider, endpoint);
         let entry = self
             .map
             .entry(Self::key(provider, endpoint))
@@ -122,6 +153,7 @@ impl StatsRegistry {
     }
 
     pub fn record_failure(&self, provider: &str, endpoint: &str, status: Option<u16>) {
+        self.evict_if_full(provider, endpoint);
         let entry = self
             .map
             .entry(Self::key(provider, endpoint))
@@ -136,6 +168,7 @@ impl StatsRegistry {
     }
 
     pub fn record_dropped(&self, provider: &str, endpoint: &str) {
+        self.evict_if_full(provider, endpoint);
         let entry = self
             .map
             .entry(Self::key(provider, endpoint))
@@ -146,6 +179,7 @@ impl StatsRegistry {
     /// Records a rate-limit response and returns how many requests had been
     /// sent to this endpoint since the previous limit was recorded.
     pub fn record_rate_limit(&self, provider: &str, endpoint: &str, status: u16) -> u64 {
+        self.evict_if_full(provider, endpoint);
         let entry = self
             .map
             .entry(Self::key(provider, endpoint))
@@ -322,5 +356,35 @@ mod tests {
         assert_eq!(snaps[0].requests_total, 42);
         assert_eq!(snaps[0].successes, 40);
         assert_eq!(snaps[0].observed_limit_threshold, Some(100));
+    }
+
+    #[test]
+    fn map_is_bounded_by_max_entries() {
+        let stats = StatsRegistry::new();
+        for i in 0..(MAX_ENTRIES + 100) {
+            stats.record_request("provider", &format!("endpoint/{i}"), None);
+        }
+        assert!(
+            stats.map.len() <= MAX_ENTRIES,
+            "map grew to {} entries",
+            stats.map.len()
+        );
+        assert!(stats.snapshot().len() <= MAX_ENTRIES);
+    }
+
+    #[test]
+    fn existing_key_is_not_evicted_when_full() {
+        let stats = StatsRegistry::new();
+        for i in 0..MAX_ENTRIES {
+            stats.record_request("provider", &format!("endpoint/{i}"), None);
+        }
+        // Updating a key already present must not drop that key's counters.
+        stats.record_success("provider", "endpoint/0", 200);
+        let snaps = stats.snapshot();
+        let entry = snaps
+            .iter()
+            .find(|s| s.endpoint == "endpoint/0")
+            .expect("existing endpoint was evicted");
+        assert_eq!(entry.successes, 1);
     }
 }
