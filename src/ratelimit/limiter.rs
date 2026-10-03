@@ -13,6 +13,17 @@ use crate::config::{BackoffConfig, ProviderConfig};
 use crate::error::AppError;
 use crate::ratelimit::{backoff::BackoffState, stats::StatsRegistry};
 
+/// Upper bound applied to `drop_after_wait` when computing the shared deadline.
+/// Config validation already caps this, but a pathological value must never
+/// panic `Instant + Duration`.
+const MAX_DROP_AFTER_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Bounds on the interval between recovery probes once a provider is in a
+/// backoff longer than the wait budget: often enough to recover, rare enough
+/// that many callers cannot all bypass the window at once.
+const MIN_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, thiserror::Error)]
 pub enum LimitError {
     #[error("dropped after waiting {wait_ms}ms: {reason}")]
@@ -128,34 +139,32 @@ impl ProviderRuntime {
             .restore(failures, remaining, Instant::now());
     }
 
-    /// Per-endpoint limiter (first path segment) if configured, else the default.
-    fn limiter_for(&self, endpoint: &str) -> &DefaultDirectRateLimiter {
+    /// Per-endpoint limiter (first path segment) if one is configured. The
+    /// provider-wide `limiter` is always enforced in addition to this one.
+    fn endpoint_limiter_for(&self, endpoint: &str) -> Option<&DefaultDirectRateLimiter> {
         let segment = endpoint.split('/').next().unwrap_or(endpoint);
-        self.endpoint_limiters.get(segment).unwrap_or(&self.limiter)
+        self.endpoint_limiters.get(segment)
     }
 
-    /// Waits for a rate-limit permit, the backoff window and a concurrency slot.
-    ///
-    /// A single deadline (`drop_after_wait`) spans all three stages, so the total
-    /// time spent waiting can never exceed the budget even if each stage fits
-    /// individually.
-    pub async fn acquire(&self, endpoint: &str) -> Result<OwnedSemaphorePermit, LimitError> {
-        let budget = self.backoff_config.drop_after_wait;
-        let deadline = tokio::time::Instant::now() + budget;
+    /// Arms (or fires) the recovery probe gate. Returns `true` when this caller
+    /// may attempt a probe; every other caller keeps being dropped until the
+    /// probe interval elapses or a success resets the backoff.
+    fn begin_probe(&self, budget: Duration) -> bool {
+        let interval = budget.clamp(MIN_PROBE_INTERVAL, MAX_PROBE_INTERVAL);
+        self.backoff
+            .lock()
+            .try_begin_probe(Instant::now(), interval)
+    }
 
-        let wait = self.backoff_remaining();
-        if wait > budget {
-            self.stats.record_dropped(&self.name, endpoint);
-            return Err(LimitError::Dropped {
-                wait_ms: wait.as_millis() as u64,
-                reason: "provider is in backoff".to_string(),
-            });
-        }
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
-        }
-
-        let limiter = self.limiter_for(endpoint);
+    /// Waits for `limiter` to have capacity within the shared deadline.
+    async fn wait_for_limiter(
+        &self,
+        limiter: &DefaultDirectRateLimiter,
+        deadline: tokio::time::Instant,
+        budget: Duration,
+        endpoint: &str,
+        reason: &str,
+    ) -> Result<(), LimitError> {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero()
             || tokio::time::timeout(remaining, limiter.until_ready())
@@ -165,8 +174,61 @@ impl ProviderRuntime {
             self.stats.record_dropped(&self.name, endpoint);
             return Err(LimitError::Dropped {
                 wait_ms: budget.as_millis() as u64,
-                reason: "rate limiter queue wait exceeded total budget".to_string(),
+                reason: reason.to_string(),
             });
+        }
+        Ok(())
+    }
+
+    /// Waits for a rate-limit permit, the backoff window and a concurrency slot.
+    ///
+    /// A single deadline (`drop_after_wait`) spans all three stages, so the total
+    /// time spent waiting can never exceed the budget even if each stage fits
+    /// individually.
+    pub async fn acquire(&self, endpoint: &str) -> Result<OwnedSemaphorePermit, LimitError> {
+        let budget = self.backoff_config.drop_after_wait.min(MAX_DROP_AFTER_WAIT);
+        // `Instant + Duration` panics on overflow; clamp the budget and fall
+        // back to "no time left" so a pathological config cannot crash us.
+        let now = tokio::time::Instant::now();
+        let deadline = now.checked_add(budget).unwrap_or(now);
+
+        let wait = self.backoff_remaining();
+        if wait > budget {
+            // The backoff is longer than we are willing to wait. Rather than
+            // dropping every request forever (which would mean no success can
+            // ever reset the backoff), allow a single periodic probe through.
+            if !self.begin_probe(budget) {
+                self.stats.record_dropped(&self.name, endpoint);
+                return Err(LimitError::Dropped {
+                    wait_ms: wait.as_millis() as u64,
+                    reason: "provider is in backoff".to_string(),
+                });
+            }
+        } else if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+
+        // Consume from the provider-wide budget first, then from any endpoint
+        // override. BOTH must have capacity, so an endpoint-specific rate can
+        // never push aggregate usage above `requests_per_second`.
+        self.wait_for_limiter(
+            &self.limiter,
+            deadline,
+            budget,
+            endpoint,
+            "rate limiter queue wait exceeded total budget",
+        )
+        .await?;
+
+        if let Some(limiter) = self.endpoint_limiter_for(endpoint) {
+            self.wait_for_limiter(
+                limiter,
+                deadline,
+                budget,
+                endpoint,
+                "endpoint rate limiter queue wait exceeded total budget",
+            )
+            .await?;
         }
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -243,9 +305,14 @@ fn quota_for_rps(requests_per_second: f64, burst: u32) -> Quota {
     }
     // `1 / rps` can overflow a `Duration` (or be non-finite) for very small
     // positive rates, and `Duration::from_secs_f64` would panic. Clamp to a
-    // sane range and fall back to a one-second period if conversion fails; we
-    // must never panic on user-supplied config.
-    let secs = (1.0 / requests_per_second).clamp(1e-9, 86_400.0);
+    // range that still honours every rate the config accepts (down to 1e-6
+    // rps => a 1,000,000 s period) and fall back to a one-second period if
+    // conversion fails; we must never panic on user-supplied config.
+    //
+    // The previous 86,400 s cap silently enforced a *faster* rate than any
+    // configured value below ~1.16e-5 rps; that under-enforcement is fixed by
+    // raising the cap to match the accepted minimum.
+    let secs = (1.0 / requests_per_second).clamp(1e-9, 1_000_000.0);
     let period = Duration::try_from_secs_f64(secs).unwrap_or(Duration::from_secs(1));
     Quota::with_period(period)
         .expect("period is non-zero")
@@ -321,6 +388,65 @@ mod tests {
         assert!(matches!(err, LimitError::Dropped { .. }));
         let snaps = stats.snapshot();
         assert_eq!(snaps[0].dropped, 1);
+    }
+
+    #[test]
+    fn quota_honours_low_rates_instead_of_speeding_them_up() {
+        // 1e-6 rps is the smallest accepted rate; it must enforce a 1,000,000 s
+        // period rather than being clamped to the old 86,400 s cap.
+        assert_eq!(
+            quota_for_rps(1e-6, 1).replenish_interval(),
+            Duration::from_secs(1_000_000)
+        );
+        // Just below the old cap (~1.16e-5 rps) must also be exact.
+        assert_eq!(
+            quota_for_rps(1.0 / 100_000.0, 1).replenish_interval(),
+            Duration::from_secs(100_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_override_cannot_exceed_provider_budget() {
+        let stats = Arc::new(StatsRegistry::new());
+        let mut cfg = AppConfig::default();
+        cfg.backoff.drop_after_wait = Duration::from_millis(50);
+        cfg.backoff.base_delay = Duration::from_millis(1);
+        cfg.backoff.jitter = 0.0;
+
+        let mut provider = test_config(1.0, 1);
+        provider.endpoint_rps.insert("search".to_string(), 100.0);
+        provider.max_concurrency = 10;
+        let rt = ProviderRuntime::new("tmdb", provider, cfg.backoff, stats).unwrap();
+
+        // The first request consumes the provider's single burst token.
+        let permit = rt.acquire("search/movie").await.unwrap();
+        drop(permit);
+
+        // A second immediate request must be gated by the provider-wide limiter
+        // even though the endpoint override would allow 100 rps.
+        let err = rt.acquire("search/movie").await.unwrap_err();
+        assert!(matches!(err, LimitError::Dropped { .. }));
+    }
+
+    #[tokio::test]
+    async fn endpoint_override_is_also_enforced() {
+        let stats = Arc::new(StatsRegistry::new());
+        let mut cfg = AppConfig::default();
+        cfg.backoff.drop_after_wait = Duration::from_millis(50);
+        cfg.backoff.base_delay = Duration::from_millis(1);
+        cfg.backoff.jitter = 0.0;
+
+        let mut provider = test_config(1000.0, 100);
+        provider.endpoint_rps.insert("search".to_string(), 1.0);
+        provider.max_concurrency = 10;
+        let rt = ProviderRuntime::new("tmdb", provider, cfg.backoff, stats).unwrap();
+
+        let permit = rt.acquire("search/movie").await.unwrap();
+        drop(permit);
+
+        // Provider budget is ample, so the endpoint limiter is what drops this.
+        let err = rt.acquire("search/movie").await.unwrap_err();
+        assert!(matches!(err, LimitError::Dropped { .. }));
     }
 
     #[tokio::test]

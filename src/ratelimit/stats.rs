@@ -78,6 +78,12 @@ pub struct EndpointStatSnapshot {
 #[derive(Debug, Default)]
 pub struct StatsRegistry {
     map: DashMap<Key, EndpointEntry>,
+    /// Serialises the "make room then insert" path so the `MAX_ENTRIES` bound
+    /// holds under concurrency. A plain DashMap `len()` check is racy: many
+    /// threads can all observe `len() < MAX` and overshoot. Lock ordering is
+    /// always `capacity_lock` -> DashMap shard -> inner locks; `snapshot` never
+    /// takes `capacity_lock`, so there is no cycle.
+    capacity_lock: Mutex<()>,
 }
 
 impl StatsRegistry {
@@ -89,19 +95,41 @@ impl StatsRegistry {
         (provider.to_string(), endpoint.to_string())
     }
 
-    /// Bounds the map size before inserting a new key. Existing keys are never
-    /// evicted here (they are already counted); only arbitrary entries are
-    /// removed to make room. Keys are collected before removal so no DashMap
-    /// references are held across mutation.
-    fn evict_if_full(&self, provider: &str, endpoint: &str) {
+    /// Runs `f` against the entry for `(provider, endpoint)`, inserting it first
+    /// if absent. Insertion is bounded by `MAX_ENTRIES` and serialised by
+    /// `capacity_lock` so the cap cannot be overshot; existing keys are updated
+    /// on the lock-free fast path.
+    fn with_entry<R>(
+        &self,
+        provider: &str,
+        endpoint: &str,
+        f: impl FnOnce(&EndpointEntry) -> R,
+    ) -> R {
+        let key = Self::key(provider, endpoint);
+        if let Some(entry) = self.map.get(&key) {
+            return f(entry.value());
+        }
+
+        let _guard = self.capacity_lock.lock();
+        // Re-check under the lock: another thread may have inserted it while we
+        // were waiting.
+        if let Some(entry) = self.map.get(&key) {
+            return f(entry.value());
+        }
+        self.evict_for_insert_locked();
+        let entry = self.map.entry(key).or_insert_with(EndpointEntry::new);
+        f(entry.value())
+    }
+
+    /// Called with `capacity_lock` held and the target key absent. Removes
+    /// enough entries to guarantee the following insert cannot exceed the cap.
+    /// Keys are collected before removal so no DashMap references are held
+    /// across mutation.
+    fn evict_for_insert_locked(&self) {
         if self.map.len() < MAX_ENTRIES {
             return;
         }
-        let key = Self::key(provider, endpoint);
-        if self.map.contains_key(&key) {
-            return;
-        }
-        let to_remove = self.map.len().saturating_sub(MAX_ENTRIES) + 1;
+        let to_remove = self.map.len() - MAX_ENTRIES + 1;
         let keys: Vec<Key> = self
             .map
             .iter()
@@ -114,147 +142,132 @@ impl StatsRegistry {
     }
 
     pub fn record_request(&self, provider: &str, endpoint: &str, noted_limit: Option<&str>) {
-        self.evict_if_full(provider, endpoint);
-        let entry = self
-            .map
-            .entry(Self::key(provider, endpoint))
-            .or_insert_with(EndpointEntry::new);
-        entry
-            .counters
-            .requests_total
-            .fetch_add(1, Ordering::Relaxed);
-        entry
-            .counters
-            .requests_since_limit
-            .fetch_add(1, Ordering::Relaxed);
-        entry
-            .counters
-            .last_request_at
-            .store(now_millis(), Ordering::Relaxed);
-        if let Some(note) = noted_limit {
-            let mut guard = entry.noted_limit.write();
-            if guard.is_none() {
-                *guard = Some(note.to_string());
+        self.with_entry(provider, endpoint, |entry| {
+            entry
+                .counters
+                .requests_total
+                .fetch_add(1, Ordering::Relaxed);
+            entry
+                .counters
+                .requests_since_limit
+                .fetch_add(1, Ordering::Relaxed);
+            entry
+                .counters
+                .last_request_at
+                .store(now_millis(), Ordering::Relaxed);
+            if let Some(note) = noted_limit {
+                let mut guard = entry.noted_limit.write();
+                if guard.is_none() {
+                    *guard = Some(note.to_string());
+                }
             }
-        }
+        });
     }
 
     pub fn record_success(&self, provider: &str, endpoint: &str, status: u16) {
-        self.evict_if_full(provider, endpoint);
-        let entry = self
-            .map
-            .entry(Self::key(provider, endpoint))
-            .or_insert_with(EndpointEntry::new);
-        entry.counters.successes.fetch_add(1, Ordering::Relaxed);
-        entry
-            .counters
-            .last_status
-            .store(status as u64, Ordering::Relaxed);
-    }
-
-    pub fn record_failure(&self, provider: &str, endpoint: &str, status: Option<u16>) {
-        self.evict_if_full(provider, endpoint);
-        let entry = self
-            .map
-            .entry(Self::key(provider, endpoint))
-            .or_insert_with(EndpointEntry::new);
-        entry.counters.failures.fetch_add(1, Ordering::Relaxed);
-        if let Some(s) = status {
+        self.with_entry(provider, endpoint, |entry| {
+            entry.counters.successes.fetch_add(1, Ordering::Relaxed);
             entry
                 .counters
                 .last_status
-                .store(s as u64, Ordering::Relaxed);
-        }
+                .store(status as u64, Ordering::Relaxed);
+        });
+    }
+
+    pub fn record_failure(&self, provider: &str, endpoint: &str, status: Option<u16>) {
+        self.with_entry(provider, endpoint, |entry| {
+            entry.counters.failures.fetch_add(1, Ordering::Relaxed);
+            if let Some(s) = status {
+                entry
+                    .counters
+                    .last_status
+                    .store(s as u64, Ordering::Relaxed);
+            }
+        });
     }
 
     pub fn record_dropped(&self, provider: &str, endpoint: &str) {
-        self.evict_if_full(provider, endpoint);
-        let entry = self
-            .map
-            .entry(Self::key(provider, endpoint))
-            .or_insert_with(EndpointEntry::new);
-        entry.counters.dropped.fetch_add(1, Ordering::Relaxed);
+        self.with_entry(provider, endpoint, |entry| {
+            entry.counters.dropped.fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     /// Records a rate-limit response and returns how many requests had been
     /// sent to this endpoint since the previous limit was recorded.
     pub fn record_rate_limit(&self, provider: &str, endpoint: &str, status: u16) -> u64 {
-        self.evict_if_full(provider, endpoint);
-        let entry = self
-            .map
-            .entry(Self::key(provider, endpoint))
-            .or_insert_with(EndpointEntry::new);
-        entry
-            .counters
-            .rate_limit_hits
-            .fetch_add(1, Ordering::Relaxed);
-        entry
-            .counters
-            .last_status
-            .store(status as u64, Ordering::Relaxed);
-        *entry.last_rate_limit_at.lock() = Some(Utc::now());
-
-        let since = entry
-            .counters
-            .requests_since_limit
-            .swap(0, Ordering::SeqCst);
-
-        if entry.observed_limit_threshold.load(Ordering::Relaxed) == 0 {
+        self.with_entry(provider, endpoint, |entry| {
             entry
-                .observed_limit_threshold
-                .store(since.max(1), Ordering::Relaxed);
-        }
-        since
+                .counters
+                .rate_limit_hits
+                .fetch_add(1, Ordering::Relaxed);
+            entry
+                .counters
+                .last_status
+                .store(status as u64, Ordering::Relaxed);
+            *entry.last_rate_limit_at.lock() = Some(Utc::now());
+
+            let since = entry
+                .counters
+                .requests_since_limit
+                .swap(0, Ordering::SeqCst);
+
+            if entry.observed_limit_threshold.load(Ordering::Relaxed) == 0 {
+                entry
+                    .observed_limit_threshold
+                    .store(since.max(1), Ordering::Relaxed);
+            }
+            since
+        })
     }
 
     /// Seeds counters from persisted state at startup (does not double count).
+    /// Uses the same bounded insertion path as the `record_*` methods so a
+    /// hostile/large persisted set cannot exceed `MAX_ENTRIES`.
     pub fn seed(&self, snap: &EndpointStatSnapshot) {
-        let entry = self
-            .map
-            .entry(Self::key(&snap.provider, &snap.endpoint))
-            .or_insert_with(EndpointEntry::new);
-        entry
-            .counters
-            .requests_total
-            .store(snap.requests_total, Ordering::Relaxed);
-        entry
-            .counters
-            .requests_since_limit
-            .store(snap.requests_since_limit, Ordering::Relaxed);
-        entry
-            .counters
-            .rate_limit_hits
-            .store(snap.rate_limit_hits, Ordering::Relaxed);
-        entry
-            .counters
-            .failures
-            .store(snap.failures, Ordering::Relaxed);
-        entry
-            .counters
-            .successes
-            .store(snap.successes, Ordering::Relaxed);
-        entry
-            .counters
-            .dropped
-            .store(snap.dropped, Ordering::Relaxed);
-        entry.counters.last_status.store(
-            snap.last_status.map(u64::from).unwrap_or(0),
-            Ordering::Relaxed,
-        );
-        entry.counters.last_request_at.store(
-            snap.last_request_at
-                .map(|dt| dt.timestamp_millis().max(0) as u64)
-                .unwrap_or(0),
-            Ordering::Relaxed,
-        );
-        *entry.last_rate_limit_at.lock() = snap.last_rate_limit_at;
-        entry.observed_limit_threshold.store(
-            snap.observed_limit_threshold.unwrap_or(0),
-            Ordering::Relaxed,
-        );
-        if let Some(note) = &snap.noted_limit {
-            *entry.noted_limit.write() = Some(note.clone());
-        }
+        self.with_entry(&snap.provider, &snap.endpoint, |entry| {
+            entry
+                .counters
+                .requests_total
+                .store(snap.requests_total, Ordering::Relaxed);
+            entry
+                .counters
+                .requests_since_limit
+                .store(snap.requests_since_limit, Ordering::Relaxed);
+            entry
+                .counters
+                .rate_limit_hits
+                .store(snap.rate_limit_hits, Ordering::Relaxed);
+            entry
+                .counters
+                .failures
+                .store(snap.failures, Ordering::Relaxed);
+            entry
+                .counters
+                .successes
+                .store(snap.successes, Ordering::Relaxed);
+            entry
+                .counters
+                .dropped
+                .store(snap.dropped, Ordering::Relaxed);
+            entry.counters.last_status.store(
+                snap.last_status.map(u64::from).unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            entry.counters.last_request_at.store(
+                snap.last_request_at
+                    .map(|dt| dt.timestamp_millis().max(0) as u64)
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            *entry.last_rate_limit_at.lock() = snap.last_rate_limit_at;
+            entry.observed_limit_threshold.store(
+                snap.observed_limit_threshold.unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            if let Some(note) = &snap.noted_limit {
+                *entry.noted_limit.write() = Some(note.clone());
+            }
+        });
     }
 
     pub fn snapshot(&self) -> Vec<EndpointStatSnapshot> {
@@ -370,6 +383,61 @@ mod tests {
             stats.map.len()
         );
         assert!(stats.snapshot().len() <= MAX_ENTRIES);
+    }
+
+    #[test]
+    fn map_bound_holds_under_concurrency() {
+        use std::sync::Arc;
+        let stats = Arc::new(StatsRegistry::new());
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let stats = stats.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..(MAX_ENTRIES / 4) {
+                    stats.record_request("provider", &format!("t{t}/e{i}"), None);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(
+            stats.map.len() <= MAX_ENTRIES,
+            "map grew to {} entries under concurrency",
+            stats.map.len()
+        );
+        assert!(stats.snapshot().len() <= MAX_ENTRIES);
+    }
+
+    fn snap(provider: &str, endpoint: &str) -> EndpointStatSnapshot {
+        EndpointStatSnapshot {
+            provider: provider.into(),
+            endpoint: endpoint.into(),
+            requests_total: 1,
+            requests_since_limit: 1,
+            rate_limit_hits: 0,
+            failures: 0,
+            successes: 1,
+            dropped: 0,
+            last_status: Some(200),
+            last_request_at: None,
+            last_rate_limit_at: None,
+            observed_limit_threshold: None,
+            noted_limit: None,
+        }
+    }
+
+    #[test]
+    fn seed_is_bounded_by_max_entries() {
+        let stats = StatsRegistry::new();
+        for i in 0..(MAX_ENTRIES + 100) {
+            stats.seed(&snap("provider", &format!("endpoint/{i}")));
+        }
+        assert!(
+            stats.map.len() <= MAX_ENTRIES,
+            "seed grew map to {} entries",
+            stats.map.len()
+        );
     }
 
     #[test]

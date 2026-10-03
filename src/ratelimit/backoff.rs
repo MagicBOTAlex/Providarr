@@ -14,6 +14,10 @@ pub struct BackoffState {
     pub consecutive_failures: u32,
     pub delay: Duration,
     pub next_allowed_at: Option<Instant>,
+    /// Earliest time the next recovery probe may be sent while the backoff
+    /// window is longer than the caller's wait budget. `None` means no probe
+    /// has been armed since the last success/restore.
+    pub next_probe_at: Option<Instant>,
 }
 
 impl BackoffState {
@@ -65,6 +69,32 @@ impl BackoffState {
         self.consecutive_failures = 0;
         self.delay = Duration::ZERO;
         self.next_allowed_at = None;
+        self.next_probe_at = None;
+    }
+
+    /// Atomically decides whether a single recovery probe may be sent while the
+    /// provider is in a backoff longer than the caller's wait budget.
+    ///
+    /// The first call after entering deep backoff only *arms* the probe timer
+    /// (and returns `false`); a probe is allowed once per `interval` thereafter.
+    /// This lets a success reset the backoff without letting a flood of callers
+    /// all bypass the window at once.
+    pub fn try_begin_probe(&mut self, now: Instant, interval: Duration) -> bool {
+        match self.next_probe_at {
+            None => {
+                // Arm the timer; the current caller is still dropped.
+                // `checked_add` overflow leaves it unarmed (next call re-arms
+                // and drops) so a pathological interval can never cause a
+                // probe storm.
+                self.next_probe_at = now.checked_add(interval);
+                false
+            }
+            Some(at) if at > now => false,
+            Some(_) => {
+                self.next_probe_at = now.checked_add(interval);
+                true
+            }
+        }
     }
 
     pub fn remaining_wait(&self, now: Instant) -> Duration {
@@ -92,6 +122,7 @@ impl BackoffState {
         } else {
             Some(now.checked_add(remaining).unwrap_or(now))
         };
+        self.next_probe_at = None;
     }
 
     /// Timeout grows with the failure count so a struggling upstream gets more
@@ -174,6 +205,35 @@ mod tests {
         assert_eq!(state.consecutive_failures, 0);
         assert_eq!(state.remaining_wait(start), Duration::ZERO);
         assert!(!state.is_in_backoff(start));
+    }
+
+    #[test]
+    fn probe_is_armed_then_limited_to_an_interval() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(10);
+        let mut state = BackoffState::new();
+
+        // First deep-backoff caller only arms the timer and is rejected.
+        assert!(!state.try_begin_probe(now, interval));
+        // Still inside the interval: rejected.
+        assert!(!state.try_begin_probe(now + Duration::from_secs(9), interval));
+        // Once the interval elapses a single probe is allowed.
+        assert!(state.try_begin_probe(now + Duration::from_secs(10), interval));
+        // And the next one is again gated by the interval.
+        assert!(!state.try_begin_probe(now + Duration::from_secs(19), interval));
+        assert!(state.try_begin_probe(now + Duration::from_secs(20), interval));
+    }
+
+    #[test]
+    fn success_resets_armed_probe() {
+        let now = Instant::now();
+        let mut state = BackoffState::new();
+        assert!(!state.try_begin_probe(now, Duration::from_secs(10)));
+        state.record_success();
+        assert!(state.next_probe_at.is_none());
+        // After a reset the probe must be re-armed (rejected once) rather than
+        // being immediately available.
+        assert!(!state.try_begin_probe(now, Duration::from_secs(10)));
     }
 
     #[test]
