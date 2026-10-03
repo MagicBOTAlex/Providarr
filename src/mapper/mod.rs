@@ -16,6 +16,10 @@ const APPEND: &str = "credits,images,external_ids,release_dates,alternative_titl
 /// far more, but the mapper only needs a bounded sample to stay responsive.
 const MAX_CHANGE_PAGES: i64 = 20;
 
+/// Upper bound on the `parts` embedded in a collection. A collection can list
+/// thousands of entries; only a bounded sample is mapped per request.
+const MAX_COLLECTION_PARTS: usize = 250;
+
 // ---------------------------------------------------------------------------
 // Output resources (Radarr shape)
 // ---------------------------------------------------------------------------
@@ -498,13 +502,14 @@ fn encode_query_value(value: &str) -> String {
     url::form_urlencoded::byte_serialize(normalized.as_bytes()).collect()
 }
 
-/// A canonical IMDb id: `tt` followed by one or more ASCII digits. Request
+/// A canonical IMDb id: `tt` followed by one to ten ASCII digits. Request
 /// values are percent-decoded upstream, so reject anything with path/query
-/// metacharacters before it reaches the provider path.
+/// metacharacters before it reaches the provider path. The digit-length cap
+/// also keeps upstream-supplied ids from being reflected unbounded.
 fn is_valid_imdb_id(value: &str) -> bool {
-    value
-        .strip_prefix("tt")
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    value.strip_prefix("tt").is_some_and(|digits| {
+        !digits.is_empty() && digits.len() <= 10 && digits.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// A search `year` is only usable when it is exactly four ASCII digits.
@@ -612,7 +617,7 @@ fn map_movie(t: &TmdbMovie) -> MovieResource {
             .imdb_id
             .clone()
             .or_else(|| t.external_ids.as_ref().and_then(|e| e.imdb_id.clone()))
-            .filter(|id| !id.trim().is_empty()),
+            .filter(|id| is_valid_imdb_id(id)),
         overview: t.overview.clone(),
         title: t.title.clone().unwrap_or_default(),
         original_title: Some(original_title),
@@ -703,7 +708,12 @@ fn map_collection(c: &TmdbCollection) -> CollectionResource {
         tmdb_id: c.id,
         images: movie_images(c.poster_path.as_deref(), c.backdrop_path.as_deref()),
         translations: Vec::new(),
-        parts: c.parts.iter().map(map_movie).collect(),
+        parts: c
+            .parts
+            .iter()
+            .take(MAX_COLLECTION_PARTS)
+            .map(map_movie)
+            .collect(),
     }
 }
 
@@ -909,11 +919,43 @@ mod tests {
     fn validates_imdb_ids() {
         assert!(is_valid_imdb_id("tt0000001"));
         assert!(is_valid_imdb_id("tt1"));
+        // Ten digits is the cap; longer ids are rejected.
+        assert!(is_valid_imdb_id("tt1234567890"));
         assert!(!is_valid_imdb_id("tt"));
         assert!(!is_valid_imdb_id("0000001"));
         assert!(!is_valid_imdb_id("tt12ab"));
+        assert!(!is_valid_imdb_id("tt12345678901"));
         assert!(!is_valid_imdb_id("tt1/../../evil?x=1"));
         assert!(!is_valid_imdb_id("tt1%2F.."));
+    }
+
+    #[test]
+    fn movie_drops_invalid_upstream_imdb_id() {
+        let invalid = map_movie(
+            &serde_json::from_str::<TmdbMovie>(r#"{"id":1,"imdb_id":"tt12345678901"}"#).unwrap(),
+        );
+        assert_eq!(invalid.imdb_id, None);
+
+        let valid = map_movie(
+            &serde_json::from_str::<TmdbMovie>(r#"{"id":1,"imdb_id":"tt0000001"}"#).unwrap(),
+        );
+        assert_eq!(valid.imdb_id.as_deref(), Some("tt0000001"));
+    }
+
+    #[test]
+    fn collection_parts_are_capped() {
+        let parts: Vec<String> = (0..(MAX_COLLECTION_PARTS + 10))
+            .map(|i| format!(r#"{{"id":{i},"title":"Part {i}"}}"#))
+            .collect();
+        let raw = format!(
+            r#"{{"id":1,"name":"Collection","parts":[{}]}}"#,
+            parts.join(",")
+        );
+        let collection: TmdbCollection = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            map_collection(&collection).parts.len(),
+            MAX_COLLECTION_PARTS
+        );
     }
 
     #[test]

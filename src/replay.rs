@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -12,8 +13,25 @@ use sha2::{Digest, Sha256};
 /// Largest fixture or recorded file we are willing to read from disk.
 const MAX_FIXTURE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Largest single response body served from or written to the replay cache.
+///
+/// The live cache cap (`cache.max_body_bytes`) is not available to this module,
+/// so replay bodies are bounded by the same constant as fixture files instead.
+/// This keeps recorded/fixture responses from bypassing the cache body cap by
+/// more than the fixture allowance.
+const MAX_REPLAY_BODY_BYTES: usize = MAX_FIXTURE_BYTES as usize;
+
 /// Largest number of `recorded/*.json` entries processed during a load.
 const MAX_RECORDED_ENTRIES: usize = 10_000;
+
+/// Total recorded body bytes kept by the replay cache. Once the quota is
+/// reached new responses are refused, so a public instance cannot grow the
+/// replay cache without bound.
+const MAX_RECORDED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Recorded entries are identified by this `file` prefix so the quota can
+/// distinguish them from manifest fixtures loaded from the caller's manifest.
+const RECORDED_PREFIX: &str = "recorded/";
 
 /// A canned upstream response used while developing offline.
 #[derive(Debug, Clone, Deserialize)]
@@ -137,8 +155,7 @@ impl ReplayStore {
         };
 
         let read = |file: &str| -> Option<Bytes> {
-            let path = resolve_fixture(&canonical_root, file)?;
-            read_fixture(&path)
+            load_fixture(&canonical_root, file).map(|(_, body)| body)
         };
 
         let collect = |specs: Vec<MetadataSpec>| -> HashMap<String, Bytes> {
@@ -190,6 +207,12 @@ impl ReplayStore {
             Err(_) => return,
         };
 
+        let mut total_bytes: usize = upstream
+            .iter()
+            .filter(|(spec, _)| spec.file.starts_with(RECORDED_PREFIX))
+            .map(|(_, body)| body.len())
+            .sum();
+
         for (index, entry) in entries.flatten().enumerate() {
             if index >= MAX_RECORDED_ENTRIES {
                 tracing::warn!(
@@ -205,18 +228,14 @@ impl ReplayStore {
                 continue;
             }
 
-            // Re-resolve through the confinement check so a symlinked entry
-            // cannot point outside the fixture root.
             let Ok(name) = entry.file_name().into_string() else {
                 tracing::warn!(file = %path.display(), "skipping recorded response with non-UTF-8 name");
                 continue;
             };
-            let relative = format!("recorded/{name}");
-            let Some(path) = resolve_fixture(root, &relative) else {
-                continue;
-            };
-
-            let Some(raw) = read_fixture(&path) else {
+            let relative = format!("{RECORDED_PREFIX}{name}");
+            // Open and read in one step so the confinement check and the read
+            // operate on the same handle.
+            let Some((path, raw)) = load_fixture(root, &relative) else {
                 continue;
             };
 
@@ -236,9 +255,32 @@ impl ReplayStore {
                 content_type: record.content_type,
                 status: record.status,
             };
+            let body = Bytes::from(record.body.into_bytes());
 
-            upstream.retain(|(existing, _)| !same_key(existing, &spec));
-            upstream.push((spec, Bytes::from(record.body.into_bytes())));
+            let existing = upstream.iter().position(|(e, _)| same_key(e, &spec));
+            let replaced_bytes = existing
+                .filter(|&i| upstream[i].0.file.starts_with(RECORDED_PREFIX))
+                .map(|i| upstream[i].1.len())
+                .unwrap_or_default();
+            if total_bytes
+                .saturating_sub(replaced_bytes)
+                .saturating_add(body.len())
+                > MAX_RECORDED_BYTES
+            {
+                tracing::warn!(
+                    bytes = total_bytes,
+                    incoming = body.len(),
+                    max = MAX_RECORDED_BYTES,
+                    "ignoring recorded responses beyond byte quota"
+                );
+                continue;
+            }
+
+            if let Some(i) = existing {
+                upstream.remove(i);
+            }
+            total_bytes = total_bytes.saturating_sub(replaced_bytes) + body.len();
+            upstream.push((spec, body));
         }
     }
 
@@ -262,19 +304,62 @@ impl ReplayStore {
         }
 
         // Key on the full path and query so `/movie/1?language=en` and
-        // `/movie/1?language=fr` are stored (and hashed) independently.
+        // `/movie/1?language=fr` are stored (and hashed) independently. The
+        // `recorded/` prefix marks the entry as quota-accounted.
+        let method = method.to_ascii_uppercase();
+        let file = format!(
+            "{RECORDED_PREFIX}{}",
+            record_file_name(provider, &method, path_and_query)
+        );
         let spec = FixtureSpec {
             provider: provider.to_string(),
-            method: method.to_ascii_uppercase(),
+            method,
             path: path_and_query.to_string(),
-            file: String::new(),
+            file,
             content_type: content_type.clone(),
             status,
         };
 
         {
             let mut upstream = self.upstream.write();
-            upstream.retain(|(existing, _)| !same_key(existing, &spec));
+            let existing = upstream.iter().position(|(e, _)| same_key(e, &spec));
+            let replacing = existing
+                .map(|i| upstream[i].0.file.starts_with(RECORDED_PREFIX))
+                .unwrap_or(false);
+            let replaced_bytes = if replacing {
+                existing.map(|i| upstream[i].1.len()).unwrap_or_default()
+            } else {
+                0
+            };
+            let recorded_count = upstream
+                .iter()
+                .filter(|(spec, _)| spec.file.starts_with(RECORDED_PREFIX))
+                .count();
+            let recorded_bytes: usize = upstream
+                .iter()
+                .filter(|(spec, _)| spec.file.starts_with(RECORDED_PREFIX))
+                .map(|(_, body)| body.len())
+                .sum();
+
+            if !within_record_quota(
+                recorded_count,
+                recorded_bytes,
+                replacing,
+                replaced_bytes,
+                body.len(),
+            ) {
+                tracing::warn!(
+                    count = recorded_count,
+                    bytes = recorded_bytes,
+                    incoming = body.len(),
+                    "replay recording quota reached; refusing to record"
+                );
+                return;
+            }
+
+            if let Some(i) = existing {
+                upstream.remove(i);
+            }
             upstream.push((spec.clone(), body.clone()));
         }
 
@@ -319,18 +404,27 @@ impl ReplayStore {
         method: &str,
         path_and_query: &str,
     ) -> Option<ReplayResponse> {
-        self.upstream
-            .read()
+        let upstream = self.upstream.read();
+        // An exact path+query match always wins over a query-less wildcard,
+        // regardless of insertion order. Otherwise a query-less manifest fixture
+        // would shadow an exact recorded entry for the same path.
+        let hit = upstream
             .iter()
-            .find(|(spec, _)| matches_request(spec, provider, method, path_and_query))
-            .map(|(spec, body)| ReplayResponse {
-                status: spec.status,
-                content_type: spec
-                    .content_type
-                    .clone()
-                    .or_else(|| Some("application/json".to_string())),
-                body: body.clone(),
-            })
+            .find(|(spec, _)| exact_match(spec, provider, method, path_and_query))
+            .or_else(|| {
+                upstream
+                    .iter()
+                    .find(|(spec, _)| wildcard_match(spec, provider, method, path_and_query))
+            })?;
+        Some(ReplayResponse {
+            status: hit.0.status,
+            content_type: hit
+                .0
+                .content_type
+                .clone()
+                .or_else(|| Some("application/json".to_string())),
+            body: hit.1.clone(),
+        })
     }
 
     pub fn movie(&self, id: &str) -> Option<Bytes> {
@@ -356,33 +450,61 @@ fn strip_query(path_and_query: &str) -> &str {
     path_and_query.split('?').next().unwrap_or(path_and_query)
 }
 
-/// Matches a stored spec against an incoming request.
-///
-/// An exact path+query match always wins. Query-less entries (manifest fixtures
-/// and legacy recordings) act as a wildcard for any query, which keeps offline
-/// fixtures usable; entries that carry a query are only returned for that exact
-/// query, so variants such as `?language=en` and `?language=fr` never collide.
-fn matches_request(spec: &FixtureSpec, provider: &str, method: &str, path_and_query: &str) -> bool {
-    if !spec.provider.eq_ignore_ascii_case(provider) || !spec.method.eq_ignore_ascii_case(method) {
-        return false;
-    }
-
-    spec.path == path_and_query
-        || (!spec.path.contains('?') && spec.path == strip_query(path_and_query))
+/// An exact `path == path_and_query` match for the same provider and method.
+fn exact_match(spec: &FixtureSpec, provider: &str, method: &str, path_and_query: &str) -> bool {
+    spec.provider.eq_ignore_ascii_case(provider)
+        && spec.method.eq_ignore_ascii_case(method)
+        && spec.path == path_and_query
 }
 
-/// Resolves a manifest/recorded `file` within `root`, rejecting absolute paths,
-/// traversal components, and symlinks that escape the root.
-fn resolve_fixture(root: &Path, file: &str) -> Option<PathBuf> {
+/// A query-less entry (manifest fixture or legacy recording) matching any query
+/// for the same provider/method/path. This keeps offline fixtures usable.
+fn wildcard_match(spec: &FixtureSpec, provider: &str, method: &str, path_and_query: &str) -> bool {
+    spec.provider.eq_ignore_ascii_case(provider)
+        && spec.method.eq_ignore_ascii_case(method)
+        && !spec.path.contains('?')
+        && spec.path == strip_query(path_and_query)
+}
+
+/// Returns true when a new recorded body may be admitted under the count and
+/// total-byte quotas. `replacing` means the same key already exists, in which
+/// case its `replaced_bytes` do not count against the quota.
+fn within_record_quota(
+    recorded_count: usize,
+    recorded_bytes: usize,
+    replacing: bool,
+    replaced_bytes: usize,
+    incoming_bytes: usize,
+) -> bool {
+    if incoming_bytes > MAX_REPLAY_BODY_BYTES {
+        return false;
+    }
+    if !replacing && recorded_count >= MAX_RECORDED_ENTRIES {
+        return false;
+    }
+    recorded_bytes
+        .saturating_sub(replaced_bytes)
+        .saturating_add(incoming_bytes)
+        <= MAX_RECORDED_BYTES
+}
+
+/// Resolves, opens, and reads a manifest/recorded `file` within `root` in one
+/// step.
+///
+/// The path is canonicalized and confined to `root`, then opened once; the body
+/// is read from that handle rather than re-resolving the name, so a path swap
+/// between the confinement check and the read cannot escape the root. `..` is
+/// rejected, while `.` is harmless after canonicalization and is allowed so
+/// `./`-prefixed fixtures work. Symlinked directories that escape the root are
+/// caught by the `starts_with(root)` check; a symlinked final component swapped
+/// in after canonicalization is rejected on a best-effort basis.
+fn load_fixture(root: &Path, file: &str) -> Option<(PathBuf, Bytes)> {
     let relative = Path::new(file);
     if relative.is_absolute()
         || relative.components().any(|component| {
             matches!(
                 component,
-                Component::ParentDir
-                    | Component::CurDir
-                    | Component::RootDir
-                    | Component::Prefix(_)
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         })
     {
@@ -407,31 +529,54 @@ fn resolve_fixture(root: &Path, file: &str) -> Option<PathBuf> {
         return None;
     }
 
-    Some(resolved)
-}
-
-/// Reads a fixture file, refusing anything larger than [`MAX_FIXTURE_BYTES`].
-fn read_fixture(path: &Path) -> Option<Bytes> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if metadata.len() > MAX_FIXTURE_BYTES => {
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
             tracing::warn!(
-                file = %path.display(),
-                size = metadata.len(),
+                file,
+                resolved = %resolved.display(),
+                "refusing symlinked fixture"
+            );
+            return None;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, file, "failed to stat fixture path");
+            return None;
+        }
+    }
+
+    let mut handle = match std::fs::File::open(&resolved) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(error = %err, file, "failed to open fixture");
+            return None;
+        }
+    };
+
+    // Read from the opened handle, capped so a file that grows past the limit
+    // between the metadata check and the read is still refused.
+    let mut bytes = Vec::new();
+    match (&mut handle)
+        .take(MAX_FIXTURE_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        Ok(_) if bytes.len() as u64 > MAX_FIXTURE_BYTES => {
+            tracing::warn!(
+                file,
+                size = bytes.len(),
                 max = MAX_FIXTURE_BYTES,
                 "skipping oversized fixture"
             );
             return None;
         }
-        _ => {}
-    }
-
-    match std::fs::read(path) {
-        Ok(bytes) => Some(Bytes::from(bytes)),
+        Ok(_) => {}
         Err(err) => {
-            tracing::warn!(error = %err, file = %path.display(), "failed to read fixture");
-            None
+            tracing::warn!(error = %err, file, "failed to read fixture");
+            return None;
         }
     }
+
+    Some((resolved, Bytes::from(bytes)))
 }
 
 /// A deterministic, filesystem-safe name so re-recording the same request
@@ -611,5 +756,117 @@ mod tests {
         assert!(!name.contains('/'), "unsafe name: {name}");
         assert!(!name.contains(".."), "unsafe name: {name}");
         assert!(name.ends_with(".json"), "unsafe name: {name}");
+    }
+
+    #[test]
+    fn exact_recorded_entry_beats_queryless_manifest_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("wild.json"), b"wild").unwrap();
+        let manifest = serde_json::json!({
+            "upstream": [
+                { "provider": "tmdb", "method": "GET", "path": "/movie/1", "file": "wild.json" }
+            ]
+        });
+        std::fs::write(root.join("manifest.json"), manifest.to_string()).unwrap();
+
+        std::fs::create_dir(root.join("recorded")).unwrap();
+        let recorded = RecordedResponse {
+            provider: "tmdb".to_string(),
+            method: "GET".to_string(),
+            path: "/movie/1?language=en".to_string(),
+            content_type: None,
+            status: 200,
+            body: "exact".to_string(),
+        };
+        std::fs::write(
+            root.join("recorded/exact.json"),
+            serde_json::to_vec(&recorded).unwrap(),
+        )
+        .unwrap();
+
+        let store = ReplayStore::load(root, false);
+
+        // The exact recorded entry wins even though the query-less manifest
+        // fixture was inserted first and wildcard-matches the query.
+        assert_eq!(
+            store
+                .upstream("tmdb", "GET", "/movie/1?language=en")
+                .unwrap()
+                .body,
+            Bytes::from_static(b"exact")
+        );
+        // A query with no exact recording falls back to the wildcard fixture.
+        assert_eq!(
+            store
+                .upstream("tmdb", "GET", "/movie/1?language=fr")
+                .unwrap()
+                .body,
+            Bytes::from_static(b"wild")
+        );
+    }
+
+    #[test]
+    fn record_quota_admits_and_rejects() {
+        assert!(within_record_quota(0, 0, false, 0, 10));
+        assert!(within_record_quota(
+            MAX_RECORDED_ENTRIES - 1,
+            0,
+            false,
+            0,
+            10
+        ));
+        assert!(!within_record_quota(MAX_RECORDED_ENTRIES, 0, false, 0, 10));
+        assert!(within_record_quota(MAX_RECORDED_ENTRIES, 0, true, 0, 10));
+        assert!(!within_record_quota(0, MAX_RECORDED_BYTES, false, 0, 1));
+        assert!(within_record_quota(
+            0,
+            MAX_RECORDED_BYTES,
+            true,
+            MAX_RECORDED_BYTES,
+            1
+        ));
+        assert!(!within_record_quota(
+            0,
+            0,
+            false,
+            0,
+            MAX_REPLAY_BODY_BYTES + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_refuses_oversized_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReplayStore::load(dir.path(), true);
+
+        let big = Bytes::from(vec![b'x'; MAX_REPLAY_BODY_BYTES + 1]);
+        store.record("tmdb", "GET", "/movie/big", 200, None, &big);
+
+        assert!(store.upstream("tmdb", "GET", "/movie/big").is_none());
+        let recorded = dir.path().join("recorded");
+        assert!(
+            !recorded.exists() || std::fs::read_dir(&recorded).unwrap().count() == 0,
+            "an oversized body must not be persisted"
+        );
+    }
+
+    #[test]
+    fn allows_curdir_prefixed_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("data.json"), br#"{"ok":true}"#).unwrap();
+
+        let manifest = serde_json::json!({
+            "metadata": { "movie": [{ "id": "dot", "file": "./data.json" }] }
+        });
+        std::fs::write(root.join("manifest.json"), manifest.to_string()).unwrap();
+
+        let store = ReplayStore::load(&root, false);
+        assert_eq!(
+            store.movie("dot"),
+            Some(Bytes::from_static(br#"{"ok":true}"#))
+        );
     }
 }
