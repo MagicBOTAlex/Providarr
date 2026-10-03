@@ -40,7 +40,9 @@ impl BackoffState {
         // Jitter is applied to the already-capped delay, then clamped so the
         // randomised value can never exceed `max_delay`.
         self.delay = apply_jitter(base, cfg.jitter).min(cfg.max_delay);
-        self.next_allowed_at = Some(now + self.delay);
+        // `Instant + Duration` panics on overflow; fall back to `now` so a
+        // pathological config can never crash the process.
+        self.next_allowed_at = Some(now.checked_add(self.delay).unwrap_or(now));
     }
 
     /// Extends the current backoff window so it is at least `wait` from `now`.
@@ -50,7 +52,7 @@ impl BackoffState {
         if wait.is_zero() {
             return;
         }
-        let target = now + wait;
+        let target = now.checked_add(wait).unwrap_or(now);
         if self.next_allowed_at.is_none_or(|at| at < target) {
             self.next_allowed_at = Some(target);
         }
@@ -88,7 +90,7 @@ impl BackoffState {
         self.next_allowed_at = if remaining.is_zero() {
             None
         } else {
-            Some(now + remaining)
+            Some(now.checked_add(remaining).unwrap_or(now))
         };
     }
 
@@ -248,6 +250,44 @@ mod tests {
                 c.max_delay.as_secs_f64()
             );
         }
+    }
+
+    #[test]
+    fn record_failure_never_panics_on_instant_overflow() {
+        let mut c = cfg();
+        // Large enough to overflow `Instant::checked_add` while still a valid
+        // `Duration` (so `delay_for` itself does not panic).
+        let huge = Duration::from_secs(i64::MAX as u64);
+        c.base_delay = huge;
+        c.max_delay = huge;
+        c.factor = 2.0;
+        c.jitter = 0.0;
+        let now = Instant::now();
+        let mut state = BackoffState::new();
+        state.record_failure(&c, now);
+        assert!(state.next_allowed_at.is_some());
+        // A subsequent failure must not panic either.
+        state.record_failure(&c, now);
+        assert!(state.next_allowed_at.is_some());
+    }
+
+    #[test]
+    fn enforce_minimum_wait_never_panics_on_instant_overflow() {
+        let now = Instant::now();
+        let mut state = BackoffState::new();
+        state.enforce_minimum_wait(Duration::MAX, now);
+        assert!(state.next_allowed_at.is_some());
+        // The existing window must be preserved rather than moved backwards.
+        state.enforce_minimum_wait(Duration::from_secs(5), now);
+        assert_eq!(state.remaining_wait(now), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn restore_never_panics_on_instant_overflow() {
+        let now = Instant::now();
+        let mut state = BackoffState::new();
+        state.restore(3, Duration::MAX, now);
+        assert!(state.next_allowed_at.is_some());
     }
 
     #[test]
