@@ -3,10 +3,7 @@ use std::{
     hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -24,13 +21,22 @@ use crate::config::InboundLimiterConfig;
 /// client with a rotating interface identifier cannot mint unlimited buckets.
 pub const DEFAULT_V6_PREFIX_LEN: u8 = 64;
 
-/// Hard ceiling on the number of tracked per-IP buckets. Once reached, stale
-/// buckets are evicted; if the state is still full, only a fraction of the
-/// sharded keyed state is reset so existing budgets are preserved.
+/// Lowest accepted IPv6 aggregation prefix. A prefix below /32 aggregates an
+/// enormous address range (e.g. `/0` collapses every IPv6 client into a single
+/// bucket), which both causes collateral throttling and lets one client exhaust
+/// the budget for everyone. Values below this are rejected in favour of
+/// [`DEFAULT_V6_PREFIX_LEN`].
+const MIN_V6_PREFIX_LEN: u8 = 32;
+
+/// Hard ceiling on the number of tracked per-IP buckets. Once reached, buckets
+/// whose state is indistinguishable from fresh are evicted first; if every
+/// bucket still holds live budget, the whole keyed limiter is dropped uniformly
+/// so the bound is guaranteed without letting a client target another shard.
 pub const DEFAULT_MAX_TRACKED_IPS: usize = 100_000;
 
-/// The keyed limiter is sharded so eviction resets at most one shard (a
-/// fraction of tracked budgets) instead of clearing every client's state.
+/// The keyed limiter is sharded to reduce lock contention. Eviction always acts
+/// on the whole limiter, never on an individually chosen shard, so a client
+/// cannot aim an eviction at a victim's bucket.
 const LIMITER_SHARDS: usize = 16;
 
 pub const TRUSTED_PROXIES_ENV: &str = "PROVIDARR_INBOUND_TRUSTED_PROXIES";
@@ -161,8 +167,20 @@ fn parse_forwarded_hop(raw: &str) -> Option<IpAddr> {
     }
 
     // Bracketed IPv6, optionally followed by a port: `[::1]` or `[::1]:443`.
+    // The bracket contents must be exactly an address: trailing junk such as
+    // `[::1]junk` is rejected rather than silently ignored.
     if let Some(rest) = raw.strip_prefix('[') {
-        let (addr, _port) = rest.split_once(']')?;
+        let (addr, after) = rest.split_once(']')?;
+        match after {
+            "" => {}
+            _ => {
+                let port = after.strip_prefix(':')?;
+                if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                port.parse::<u16>().ok()?;
+            }
+        }
         return parse_ip_without_zone(addr.trim());
     }
 
@@ -178,10 +196,20 @@ fn parse_forwarded_hop(raw: &str) -> Option<IpAddr> {
     }
 }
 
-/// Strips an optional `%zone` suffix and parses the remaining address.
+/// Parses an address, allowing an optional `%zone` suffix only for IPv6.
+/// Zone identifiers are meaningless for IPv4, so `1.2.3.4%eth0` is rejected
+/// instead of being silently accepted as `1.2.3.4`.
 fn parse_ip_without_zone(raw: &str) -> Option<IpAddr> {
-    let addr = raw.split('%').next().unwrap_or(raw).trim();
-    addr.parse::<IpAddr>().ok()
+    let raw = raw.trim();
+    if let Some((addr, zone)) = raw.split_once('%') {
+        if zone.is_empty() {
+            return None;
+        }
+        // Only IPv6 link-local addresses carry a zone; mapped forms are
+        // normalised later.
+        return addr.trim().parse::<Ipv6Addr>().ok().map(IpAddr::V6);
+    }
+    raw.parse::<IpAddr>().ok()
 }
 
 /// Parses a whole `X-Forwarded-For` value. Returns `None` if any non-empty hop
@@ -239,11 +267,30 @@ fn env_rules(name: &str, kind: &str) -> Vec<IpRule> {
 }
 
 fn env_v6_prefix_len() -> u8 {
-    std::env::var(V6_PREFIX_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<u8>().ok())
-        .filter(|prefix| *prefix <= 128)
-        .unwrap_or(DEFAULT_V6_PREFIX_LEN)
+    parse_v6_prefix_len(std::env::var(V6_PREFIX_ENV).ok().as_deref())
+}
+
+/// Parses and range-checks the configured IPv6 aggregation prefix. Anything
+/// below [`MIN_V6_PREFIX_LEN`] would aggregate far too much of the address space
+/// (a `/0` puts every IPv6 client in one bucket), and anything above /128 is
+/// meaningless, so both fall back to [`DEFAULT_V6_PREFIX_LEN`] with a warning.
+fn parse_v6_prefix_len(raw: Option<&str>) -> u8 {
+    let Some(raw) = raw else {
+        return DEFAULT_V6_PREFIX_LEN;
+    };
+    let Ok(prefix) = raw.trim().parse::<u8>() else {
+        return DEFAULT_V6_PREFIX_LEN;
+    };
+    if !(MIN_V6_PREFIX_LEN..=128).contains(&prefix) {
+        tracing::warn!(
+            value = prefix,
+            min = MIN_V6_PREFIX_LEN,
+            max = 128,
+            "ignoring out-of-range inbound IPv6 prefix length; using default"
+        );
+        return DEFAULT_V6_PREFIX_LEN;
+    }
+    prefix
 }
 
 fn env_max_tracked_ips() -> usize {
@@ -266,7 +313,6 @@ pub struct InboundLimiter {
     max_tracked_ips: usize,
     quota: Quota,
     limiters: Vec<RwLock<DefaultKeyedRateLimiter<IpAddr>>>,
-    evict_cursor: AtomicUsize,
     global: Option<DefaultDirectRateLimiter>,
     concurrency: Option<Arc<Semaphore>>,
 }
@@ -316,7 +362,6 @@ impl InboundLimiter {
             max_tracked_ips: env_max_tracked_ips(),
             quota,
             limiters,
-            evict_cursor: AtomicUsize::new(0),
             global,
             concurrency,
         }
@@ -434,7 +479,7 @@ impl InboundLimiter {
 
         let key = self.key_for(ip);
         let shard = self.shard_for(&key);
-        self.evict_if_needed(shard);
+        self.evict_if_needed();
 
         self.limiters[shard]
             .read()
@@ -476,11 +521,23 @@ impl InboundLimiter {
         }
     }
 
-    /// Keeps the keyed state bounded. When the tracked-key count reaches the cap,
-    /// stale buckets are dropped first; if the state is still full, only a subset
-    /// of shards is reset, so a burst of new clients cannot clear every existing
-    /// client's budget at once.
-    fn evict_if_needed(&self, protected_shard: usize) {
+    /// Keeps the keyed state bounded.
+    ///
+    /// Only buckets whose state is indistinguishable from fresh (their token
+    /// bucket has fully refilled) are evictable without affecting throttling, so
+    /// `retain_recent` is always tried first. `retain_recent` is safe: it never
+    /// removes a client's live budget.
+    ///
+    /// If the state is *still* at the cap, every remaining bucket holds live
+    /// budget and no per-shard eviction is safe. Resetting one shard would let a
+    /// client whose key hashes to another shard clear a victim's live budget (the
+    /// shard is chosen by the attacker's traffic), and leaving a single dominant
+    /// shard untouched cannot bound the total. Instead the whole limiter is
+    /// dropped uniformly: this cannot be aimed at any particular client and it
+    /// guarantees the hard bound. This is a last-resort memory guard; the
+    /// server-wide limiter remains the backstop against a client cycling many
+    /// fresh IPs to trigger it.
+    fn evict_if_needed(&self) {
         if self.tracked_keys() < self.max_tracked_ips {
             return;
         }
@@ -488,29 +545,17 @@ impl InboundLimiter {
         for shard in &self.limiters {
             shard.read().retain_recent();
         }
+        if self.tracked_keys() < self.max_tracked_ips {
+            return;
+        }
 
-        let shards = self.limiters.len();
-        let mut reset = 0;
-        while self.tracked_keys() >= self.max_tracked_ips && reset < shards {
-            // Rotate through the shards, avoiding the caller's own shard first so
-            // a client cannot trigger an eviction that refreshes its own budget.
-            let mut victim = self.evict_cursor.fetch_add(1, Ordering::Relaxed) % shards;
-            if victim == protected_shard {
-                victim = (victim + 1) % shards;
-            }
-
-            let mut shard = self.limiters[victim].write();
-            if shard.is_empty() {
-                reset += 1;
-                continue;
-            }
-            tracing::warn!(
-                max_tracked_ips = self.max_tracked_ips,
-                shard = victim,
-                "inbound per-IP state reached its bound; evicting one shard of tracked keys"
-            );
-            *shard = RateLimiter::keyed(self.quota);
-            reset += 1;
+        tracing::warn!(
+            max_tracked_ips = self.max_tracked_ips,
+            tracked_keys = self.tracked_keys(),
+            "inbound per-IP state is full of live budgets; dropping all tracked state"
+        );
+        for shard in &self.limiters {
+            *shard.write() = RateLimiter::keyed(self.quota);
         }
     }
 }
@@ -713,6 +758,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_bracketed_and_zoned_hops() {
+        // Trailing junk after a bracketed address must not be ignored.
+        assert!(parse_forwarded_hop("[::1]junk").is_none());
+        assert!(parse_forwarded_hop("[::1]:notaport").is_none());
+        assert!(parse_forwarded_hop("[::1]:70000").is_none());
+        assert!(parse_forwarded_hop("[::1]:").is_none());
+        assert!(parse_forwarded_hop("[::1").is_none());
+
+        // Zone identifiers are only valid for IPv6.
+        assert!(parse_forwarded_hop("1.2.3.4%eth0").is_none());
+        assert!(parse_forwarded_hop("1.2.3.4%eth0:443").is_none());
+
+        // Valid forms continue to parse.
+        assert_eq!(
+            parse_forwarded_hop("[::1]:443"),
+            Some("::1".parse().unwrap())
+        );
+        assert_eq!(parse_forwarded_hop("[::1]"), Some("::1".parse().unwrap()));
+        assert_eq!(
+            parse_forwarded_hop("1.2.3.4:443"),
+            Some("1.2.3.4".parse().unwrap())
+        );
+        assert_eq!(
+            parse_forwarded_hop("fe80::1%eth0"),
+            Some("fe80::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn v6_prefix_len_is_floored() {
+        assert_eq!(parse_v6_prefix_len(None), DEFAULT_V6_PREFIX_LEN);
+        assert_eq!(parse_v6_prefix_len(Some("")), DEFAULT_V6_PREFIX_LEN);
+        assert_eq!(parse_v6_prefix_len(Some("garbage")), DEFAULT_V6_PREFIX_LEN);
+        assert_eq!(parse_v6_prefix_len(Some("0")), DEFAULT_V6_PREFIX_LEN);
+        assert_eq!(parse_v6_prefix_len(Some("31")), DEFAULT_V6_PREFIX_LEN);
+        assert_eq!(parse_v6_prefix_len(Some("32")), 32);
+        assert_eq!(parse_v6_prefix_len(Some("64")), 64);
+        assert_eq!(parse_v6_prefix_len(Some("128")), 128);
+        assert_eq!(parse_v6_prefix_len(Some("129")), DEFAULT_V6_PREFIX_LEN);
+    }
+
+    #[test]
     fn all_trusted_hops_fall_back_to_peer_not_leftmost() {
         let mut limiter = InboundLimiter::new(&config(1.0, 1));
         limiter.trust_forwarded_for = true;
@@ -750,23 +837,58 @@ mod tests {
     }
 
     #[test]
-    fn eviction_resets_only_a_subset_of_shards() {
+    fn eviction_bounds_a_single_dominant_shard() {
+        // All keys deliberately land in one shard, which the old round-robin
+        // eviction could not bound once it ran out of iterations.
+        let mut limiter = InboundLimiter::new(&config(1.0, 1));
+        limiter.max_tracked_ips = 4;
+
+        for i in 0..8u32 {
+            let key: IpAddr = Ipv4Addr::from(0x0a00_0000 + i).into();
+            limiter.limiters[0].write().check_key(&key).unwrap();
+        }
+        assert_eq!(limiter.tracked_keys(), 8);
+        assert!(limiter.tracked_keys() > limiter.max_tracked_ips);
+
+        limiter.evict_if_needed();
+
+        assert!(
+            limiter.tracked_keys() < limiter.max_tracked_ips,
+            "a single dominant shard must still be bounded"
+        );
+    }
+
+    #[test]
+    fn eviction_prefers_dropping_stale_state() {
+        // A tiny period makes every bucket refill almost immediately, so the
+        // state is indistinguishable from fresh and `retain_recent` alone is
+        // enough to get back under the cap.
+        let mut limiter = InboundLimiter::new(&config(1e9, 1));
+        limiter.max_tracked_ips = 1;
+
+        let key: IpAddr = "10.0.0.1".parse().unwrap();
+        limiter.limiters[0].write().check_key(&key).unwrap();
+        assert_eq!(limiter.tracked_keys(), 1);
+        std::thread::sleep(Duration::from_millis(5));
+
+        limiter.evict_if_needed();
+        assert_eq!(limiter.tracked_keys(), 0);
+    }
+
+    #[test]
+    fn eviction_never_targets_an_individual_shard() {
+        // The same state must be produced regardless of which client triggers
+        // eviction: eviction is global, so it cannot be aimed at a victim.
         let mut limiter = InboundLimiter::new(&config(1.0, 1));
         limiter.max_tracked_ips = 2;
-
         let a: IpAddr = "10.0.0.1".parse().unwrap();
         let b: IpAddr = "10.0.0.2".parse().unwrap();
         limiter.limiters[0].write().check_key(&a).unwrap();
         limiter.limiters[1].write().check_key(&b).unwrap();
-        assert_eq!(limiter.tracked_keys(), 2);
 
-        limiter.evict_if_needed(LIMITER_SHARDS - 1);
+        limiter.evict_if_needed();
 
-        assert_eq!(
-            limiter.tracked_keys(),
-            1,
-            "only one shard is reset, so other budgets survive"
-        );
+        assert_eq!(limiter.tracked_keys(), 0, "all shards are treated alike");
     }
 
     #[test]
