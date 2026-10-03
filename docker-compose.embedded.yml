@@ -13,6 +13,18 @@ services:
       dockerfile: Dockerfile.embedded
     image: magicbotalex2/providarr:embedded
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # The entrypoint runs as root to chown PGDATA and uses gosu to drop to
+      # the postgres and providarr users; these caps are needed for that.
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     env_file:
       - .env
     environment:

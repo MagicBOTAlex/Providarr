@@ -11,6 +11,22 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # Required by the official image entrypoint to chown PGDATA and drop
+      # privileges from root to the postgres user.
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
     environment:
       POSTGRES_USER: providarr
       POSTGRES_PASSWORD: providarr
@@ -29,6 +45,13 @@ services:
       dockerfile: Dockerfile
     image: magicbotalex2/providarr:latest
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     env_file:
       - .env
     environment:
