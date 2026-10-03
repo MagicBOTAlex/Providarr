@@ -5,6 +5,10 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::{config::AuthConfig, error::AppError, ratelimit::limiter::ProviderRuntime};
 
+/// Login responses are tiny; this bounds the buffered body so a malicious or
+/// misconfigured upstream cannot exhaust memory with a decompression bomb.
+const MAX_LOGIN_BODY_BYTES: usize = 64 * 1024;
+
 /// The credentials to attach to an upstream request.
 #[derive(Debug, Clone)]
 pub enum ResolvedAuth {
@@ -138,7 +142,8 @@ impl AuthManager {
             });
         }
 
-        let body: serde_json::Value = response.json().await.map_err(AppError::Http)?;
+        let body = super::read_body_capped(response, MAX_LOGIN_BODY_BYTES).await?;
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
         let token = body
             .pointer("/data/token")
             .and_then(|value| value.as_str())

@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures::StreamExt;
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
@@ -51,6 +52,9 @@ pub struct ProviderRegistry {
     replay_enabled: bool,
     replay_fallback: bool,
     coalescing_enabled: bool,
+    /// Upper bound applied to any upstream `Retry-After`, matching the backoff
+    /// ceiling so an attacker-controlled header cannot pin a provider offline.
+    backoff_max_delay: Duration,
     coalesce: Arc<Vec<tokio::sync::Mutex<()>>>,
     /// Keys with an in-flight background revalidation. Prevents a burst of stale
     /// requests for the same key from spawning one upstream refresh each.
@@ -96,6 +100,7 @@ impl ProviderRegistry {
             replay_fallback: config.replay.fallback_to_upstream,
             replay,
             coalescing_enabled: config.cache.request_coalescing,
+            backoff_max_delay: config.backoff.max_delay,
             coalesce: Arc::new((0..64).map(|_| tokio::sync::Mutex::new(())).collect()),
             revalidating: Arc::new(DashMap::new()),
         })
@@ -292,7 +297,7 @@ impl ProviderRegistry {
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(err) = this
+            if this
                 .fetch_upstream(
                     &provider_name,
                     &method_upper,
@@ -301,8 +306,13 @@ impl ProviderRegistry {
                     path,
                 )
                 .await
+                .is_err()
             {
-                tracing::debug!(error = %err, "background revalidation failed");
+                tracing::debug!(
+                    provider = %provider_name,
+                    method = %method_upper,
+                    "background revalidation failed"
+                );
             }
             this.revalidating.remove(&cache_key);
             notify.notify_waiters();
@@ -323,10 +333,12 @@ impl ProviderRegistry {
             .ok_or_else(|| AppError::UnknownProvider(provider_name.to_string()))?;
 
         let auth = provider.auth.resolve(&provider.runtime).await?;
-        let mut url = build_url(&provider.config.base_url, path_and_query);
+        let mut url = build_url(&provider.config.base_url, path_and_query)?;
         if let ResolvedAuth::Query { param, value } = &auth {
             url = append_query(url, param, value);
         }
+
+        let max_body_bytes = self.cache.config().max_body_bytes;
 
         let request_method = if method_upper == "HEAD" {
             reqwest::Method::HEAD
@@ -382,7 +394,7 @@ impl ProviderRegistry {
                             endpoint = %endpoint,
                             attempt,
                             max_attempts,
-                            error = %err,
+                            timeout = err.is_timeout(),
                             "upstream offline; retrying after backoff"
                         );
                         continue;
@@ -419,8 +431,11 @@ impl ProviderRegistry {
                 let since = provider.runtime.on_rate_limited(&endpoint, status_code);
                 if let Some(retry_after) = retry_after {
                     // Honour upstream's Retry-After when it is longer than our
-                    // own computed backoff.
-                    provider.runtime.enforce_retry_after(retry_after);
+                    // own computed backoff, but never beyond our own ceiling:
+                    // an oversized value must not pin the provider offline.
+                    provider
+                        .runtime
+                        .enforce_retry_after(retry_after.min(self.backoff_max_delay));
                 }
                 metrics::rate_limited(provider_name, &endpoint);
                 self.record_rate_limit_event(provider_name, &endpoint, since, status_code)
@@ -444,32 +459,29 @@ impl ProviderRegistry {
                 });
             }
 
-            let body = match response.bytes().await {
+            let body = match read_body_capped(response, max_body_bytes).await {
                 Ok(body) => body,
                 Err(err) => {
                     // A partial/failed body read is a transport failure just
                     // like a failed send: account for it and retry if allowed.
+                    // A body that exceeded the cap is deterministic, so skip
+                    // the retry and surface it immediately.
                     provider.runtime.on_failure(&endpoint, None);
                     metrics::upstream_error(provider_name, &endpoint);
                     self.persist_backoff(provider_name, &provider.runtime).await;
 
-                    if attempt < max_attempts {
+                    if attempt < max_attempts && !matches!(err, AppError::Upstream { .. }) {
                         tracing::warn!(
                             provider = provider_name,
                             endpoint = %endpoint,
                             attempt,
                             max_attempts,
-                            error = %err,
                             "failed to read upstream body; retrying after backoff"
                         );
                         continue;
                     }
 
-                    return Err(if err.is_timeout() {
-                        AppError::Timeout
-                    } else {
-                        AppError::Http(err)
-                    });
+                    return Err(err);
                 }
             };
 
@@ -619,12 +631,83 @@ fn entry_to_response(entry: CachedEntry, stale: bool) -> ProviderResponse {
     }
 }
 
-fn build_url(base_url: &str, path_and_query: &str) -> String {
-    format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        path_and_query.trim_start_matches('/')
-    )
+/// Reads an upstream response body, refusing to buffer more than `max` bytes.
+///
+/// The `Content-Length` header is checked first (when present) to reject an
+/// oversized body before any of it is read; the streamed body is then counted
+/// chunk by chunk so a missing/lying length or a decompression bomb is still
+/// capped. Excessively large bodies surface as `AppError::Upstream`.
+async fn read_body_capped(response: reqwest::Response, max: usize) -> Result<Bytes, AppError> {
+    let status = response.status().as_u16();
+    if let Some(len) = response.content_length()
+        && len > max as u64
+    {
+        return Err(AppError::Upstream {
+            status,
+            body: format!("upstream body of {len} bytes exceeds the {max} byte limit"),
+        });
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut body = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) if err.is_timeout() => return Err(AppError::Timeout),
+            Err(err) => return Err(AppError::Http(err)),
+        };
+        if body.len().saturating_add(chunk.len()) > max {
+            return Err(AppError::Upstream {
+                status,
+                body: format!("upstream body exceeds the {max} byte limit"),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+fn build_url(base_url: &str, path_and_query: &str) -> Result<String, AppError> {
+    if path_and_query.contains('\\') || path_and_query.chars().any(char::is_control) {
+        return Err(AppError::Internal(
+            "request path contained illegal characters".to_string(),
+        ));
+    }
+    if base_url.contains('\\') || base_url.chars().any(char::is_control) {
+        return Err(AppError::Config(
+            "provider base url contained illegal characters".to_string(),
+        ));
+    }
+
+    let mut base = url::Url::parse(base_url)
+        .map_err(|err| AppError::Config(format!("invalid provider base url: {err}")))?;
+
+    // Treat the configured base path as a directory so relative request paths
+    // are appended to it instead of replacing it.
+    if !base.path().ends_with('/') {
+        let path = format!("{}/", base.path());
+        base.set_path(&path);
+    }
+    let base_path = base.path().to_string();
+
+    let joined = base
+        .join(path_and_query.trim_start_matches('/'))
+        .map_err(|err| AppError::Internal(format!("invalid request path: {err}")))?;
+
+    // `Url` normalises `..` and absolute/network-path references, so a crafted
+    // path could otherwise escape the configured base path while still carrying
+    // the provider API key. Reject anything that leaves the base origin/path.
+    if joined.scheme() != base.scheme()
+        || joined.host_str() != base.host_str()
+        || joined.port_or_known_default() != base.port_or_known_default()
+        || !joined.path().starts_with(&base_path)
+    {
+        return Err(AppError::Internal(
+            "request path escapes the configured provider base url".to_string(),
+        ));
+    }
+
+    Ok(joined.into())
 }
 
 fn append_query(mut url: String, param: &str, value: &str) -> String {
@@ -669,6 +752,7 @@ fn cache_policy_from(cache_control: Option<&str>, config: &CacheConfig, path: &s
 }
 
 /// Parses an RFC 7231 `Retry-After` value: either delta-seconds or an HTTP-date.
+/// The result is unbounded; callers must clamp it to the backoff ceiling.
 fn parse_retry_after(value: &str) -> Option<Duration> {
     let value = value.trim();
     if let Ok(secs) = value.parse::<u64>() {
@@ -696,25 +780,105 @@ fn parse_max_age(header: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// Static path words that are safe to keep verbatim in an endpoint label. Any
+/// other non-identifier segment is collapsed to `{other}` so an attacker cannot
+/// explode metric cardinality with arbitrary path segments.
+const STATIC_SEGMENTS: &[&str] = &[
+    "movie",
+    "movies",
+    "tv",
+    "series",
+    "season",
+    "seasons",
+    "episode",
+    "episodes",
+    "collection",
+    "find",
+    "people",
+    "person",
+    "company",
+    "companies",
+    "network",
+    "networks",
+    "search",
+    "list",
+    "trending",
+    "popular",
+    "discover",
+    "changes",
+    "changed",
+    "updates",
+    "configuration",
+    "languages",
+    "language",
+    "genres",
+    "genre",
+    "countries",
+    "certifications",
+    "artwork",
+    "awards",
+    "genders",
+    "credits",
+    "credit",
+    "images",
+    "image",
+    "videos",
+    "video",
+    "external_ids",
+    "keywords",
+    "keyword",
+    "reviews",
+    "review",
+    "similar",
+    "recommendations",
+    "translations",
+    "watch",
+    "providers",
+    "movie-statuses",
+    "series-statuses",
+    "content-ratings",
+    "source-types",
+    "timezones",
+];
+
+/// Maximum number of path segments retained in an endpoint label. Anything
+/// beyond this is folded into a single trailing `{other}`.
+const MAX_ENDPOINT_SEGMENTS: usize = 6;
+
 /// Collapses opaque identifiers so accounting is grouped by resource shape,
-/// e.g. `/movie/550` and `/movie/551` both become `movie/{id}`.
+/// e.g. `/movie/550` and `/movie/551` both become `movie/{id}`. Unknown static
+/// words and excessive path depth become `{other}` to bound cardinality.
 pub fn normalize_endpoint(path_and_query: &str) -> String {
     let path = path_and_query.split('?').next().unwrap_or("");
-    let parts: Vec<String> = path
+    let segments: Vec<&str> = path
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(|segment| {
-            if is_identifier(segment) {
-                "{id}".to_string()
-            } else {
-                segment.to_ascii_lowercase()
-            }
-        })
         .collect();
-    if parts.is_empty() {
-        "root".to_string()
+    if segments.is_empty() {
+        return "root".to_string();
+    }
+
+    let truncated = segments.len() > MAX_ENDPOINT_SEGMENTS;
+    let mut parts: Vec<String> = segments
+        .iter()
+        .take(MAX_ENDPOINT_SEGMENTS)
+        .map(|segment| bucket_segment(segment))
+        .collect();
+    if truncated {
+        parts.push("{other}".to_string());
+    }
+    parts.join("/")
+}
+
+fn bucket_segment(segment: &str) -> String {
+    if is_identifier(segment) {
+        return "{id}".to_string();
+    }
+    let lower = segment.to_ascii_lowercase();
+    if STATIC_SEGMENTS.contains(&lower.as_str()) {
+        lower
     } else {
-        parts.join("/")
+        "{other}".to_string()
     }
 }
 
@@ -759,6 +923,57 @@ mod tests {
         assert_eq!(normalize_endpoint("/find/tt0944947"), "find/{id}");
         assert_eq!(normalize_endpoint("/"), "root");
         assert_eq!(normalize_endpoint(""), "root");
+    }
+
+    #[test]
+    fn buckets_unknown_segments_and_caps_depth() {
+        assert_eq!(normalize_endpoint("/foo/bar"), "{other}/{other}");
+        assert_eq!(
+            normalize_endpoint("/movie/secret-looking-slug"),
+            "movie/{other}"
+        );
+        // Known words are lowercased; unknown words collapse.
+        assert_eq!(normalize_endpoint("/Movie/Popular"), "movie/popular");
+        // Deeply nested paths are truncated to a bounded label.
+        assert_eq!(
+            normalize_endpoint("/movie/1/tv/2/person/3/foo/bar/baz"),
+            "movie/{id}/tv/{id}/person/{id}/{other}"
+        );
+    }
+
+    #[test]
+    fn build_url_preserves_base_and_query() {
+        assert_eq!(
+            build_url("https://api.example.com/3", "/movie/550?language=en").unwrap(),
+            "https://api.example.com/3/movie/550?language=en"
+        );
+        assert_eq!(
+            build_url("https://api.example.com/3", "movie/550").unwrap(),
+            "https://api.example.com/3/movie/550"
+        );
+    }
+
+    #[test]
+    fn build_url_rejects_base_path_escape() {
+        for path in [
+            "/../admin",
+            "movie/../../admin",
+            "/movie/%2e%2e/%2e%2e/admin",
+            "https://evil.example.com/x",
+            "/movie\\..\\admin",
+            "/movie/\u{0000}",
+        ] {
+            assert!(
+                build_url("https://api.example.com/3", path).is_err(),
+                "expected rejection for {path:?}"
+            );
+        }
+        // A protocol-relative reference is treated as a relative path, so it
+        // stays on the configured origin instead of escaping.
+        assert_eq!(
+            build_url("https://api.example.com/3", "//evil.example.com/x").unwrap(),
+            "https://api.example.com/3/evil.example.com/x"
+        );
     }
 
     #[test]
