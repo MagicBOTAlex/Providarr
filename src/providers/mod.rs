@@ -4,7 +4,6 @@ use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use sqlx::PgPool;
-use tokio::sync::Notify;
 
 use crate::{
     cache::{CacheStore, CachedEntry},
@@ -54,11 +53,25 @@ pub struct ProviderRegistry {
     /// Upper bound applied to any upstream `Retry-After`, matching the backoff
     /// ceiling so an attacker-controlled header cannot pin a provider offline.
     backoff_max_delay: Duration,
-    coalesce: Arc<Vec<tokio::sync::Mutex<()>>>,
+    /// Per-key single-flight locks. A burst of identical misses shares one lock
+    /// so only the first performs the upstream fetch; unrelated keys never
+    /// contend. Entries are removed once no request holds the lock.
+    coalesce: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Keys with an in-flight background revalidation. Prevents a burst of stale
     /// requests for the same key from spawning one upstream refresh each.
-    revalidating: Arc<DashMap<String, Arc<Notify>>>,
+    revalidating: Arc<DashMap<String, ()>>,
+    /// Caps concurrent background revalidations so stale requests for many
+    /// distinct keys cannot spawn unbounded upstream work.
+    revalidation_permits: Arc<tokio::sync::Semaphore>,
 }
+
+/// Hard ceiling on tracked single-flight keys, guarding against unbounded map
+/// growth under a flood of distinct keys. Once exceeded, requests stop
+/// coalescing and simply fetch on their own.
+const MAX_COALESCE_ENTRIES: usize = 10_000;
+
+/// Maximum number of background revalidations allowed to run at once.
+const MAX_CONCURRENT_REVALIDATIONS: usize = 32;
 
 impl ProviderRegistry {
     pub fn build(
@@ -100,8 +113,11 @@ impl ProviderRegistry {
             replay,
             coalescing_enabled: config.cache.request_coalescing,
             backoff_max_delay: config.backoff.max_delay,
-            coalesce: Arc::new((0..64).map(|_| tokio::sync::Mutex::new(())).collect()),
+            coalesce: Arc::new(DashMap::new()),
             revalidating: Arc::new(DashMap::new()),
+            revalidation_permits: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_REVALIDATIONS,
+            )),
         })
     }
 
@@ -204,11 +220,10 @@ impl ProviderRegistry {
 
         let cache_key = CacheStore::key(provider_name, &method_upper, path_and_query);
 
-        // Single-flight: serialize concurrent misses that hash to the same shard,
-        // so a burst of identical requests triggers at most one upstream call.
-        let _guard = if self.cache.enabled() && self.coalescing_enabled {
-            let shard = shard_index(&cache_key, self.coalesce.len());
-            Some(self.coalesce[shard].lock().await)
+        // Single-flight: a per-key lock so a burst of identical misses triggers
+        // at most one upstream call, without unrelated keys blocking each other.
+        let _coalesce = if self.cache.enabled() && self.coalescing_enabled {
+            self.acquire_coalesce(&cache_key).await
         } else {
             None
         };
@@ -276,8 +291,38 @@ impl ProviderRegistry {
         }
     }
 
+    /// Acquires the per-key single-flight lock, inserting a fresh lock on first
+    /// use. Returns `None` (no coalescing) once the registry hits its hard cap,
+    /// so a flood of distinct keys cannot grow the map without bound.
+    async fn acquire_coalesce(self: &Arc<Self>, key: &str) -> Option<CoalesceGuard> {
+        use dashmap::mapref::entry::Entry;
+
+        if self.coalesce.len() >= MAX_COALESCE_ENTRIES {
+            return None;
+        }
+
+        let lock = match self.coalesce.entry(key.to_string()) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                entry.insert(Arc::clone(&lock));
+                lock
+            }
+        };
+        // The map entry guard is dropped before the await below: never hold a
+        // `DashMap` reference across `.await`.
+        let guard = Arc::clone(&lock).lock_owned().await;
+        Some(CoalesceGuard {
+            registry: Arc::clone(&self.coalesce),
+            key: key.to_string(),
+            guard: Some(guard),
+        })
+    }
+
     /// Spawns a background refresh for `cache_key` unless one is already running.
-    /// Others observing the same key serve stale and return immediately.
+    /// Others observing the same key serve stale and return immediately. If the
+    /// concurrent-revalidation budget is exhausted, the refresh is skipped
+    /// rather than blocking the caller.
     fn spawn_revalidation(
         self: &Arc<Self>,
         cache_key: String,
@@ -289,13 +334,25 @@ impl ProviderRegistry {
     ) {
         use dashmap::mapref::entry::Entry;
 
-        let notify = match self.revalidating.entry(cache_key.clone()) {
-            Entry::Occupied(_) => return,
-            Entry::Vacant(vacant) => vacant.insert(Arc::new(Notify::new())).clone(),
+        let permit = match self.revalidation_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return,
         };
+
+        match self.revalidating.entry(cache_key.clone()) {
+            Entry::Occupied(_) => return,
+            Entry::Vacant(vacant) => {
+                vacant.insert(());
+            }
+        }
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            let _permit = permit;
+            let _guard = RevalidationGuard {
+                map: Arc::clone(&this.revalidating),
+                key: cache_key,
+            };
             if this
                 .fetch_upstream(
                     &provider_name,
@@ -313,8 +370,6 @@ impl ProviderRegistry {
                     "background revalidation failed"
                 );
             }
-            this.revalidating.remove(&cache_key);
-            notify.notify_waiters();
         });
     }
 
@@ -617,6 +672,37 @@ impl ProviderRegistry {
     }
 }
 
+/// RAII holder for a per-key single-flight lock. Dropping it releases the lock
+/// and then removes the map entry if no other request still holds the lock.
+struct CoalesceGuard {
+    registry: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    key: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for CoalesceGuard {
+    fn drop(&mut self) {
+        // Release the mutex first so our own `OwnedMutexGuard` Arc no longer
+        // counts; the map plus any waiting request are all that can remain.
+        self.guard.take();
+        self.registry
+            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1);
+    }
+}
+
+/// Removes the `revalidating` marker on drop, so a panicked or aborted
+/// background task cannot leak the key and permanently block revalidation.
+struct RevalidationGuard {
+    map: Arc<DashMap<String, ()>>,
+    key: String,
+}
+
+impl Drop for RevalidationGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
+}
+
 fn entry_to_response(entry: CachedEntry, stale: bool) -> ProviderResponse {
     ProviderResponse {
         status: entry.status_code,
@@ -762,14 +848,6 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
         return Some(Duration::from_secs(secs));
     }
     None
-}
-
-fn shard_index(key: &str, shards: usize) -> usize {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    (hasher.finish() as usize) % shards.max(1)
 }
 
 fn parse_max_age(header: &str) -> Option<u64> {
