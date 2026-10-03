@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{error::AppError, state::AppState};
 
-use super::fetch_json;
+use super::{fetch_json, is_valid_imdb_id};
 
 // Amplification caps. TVDB payloads for long-running shows are large and
 // attacker-amplifiable (one request fans out into many upstream calls), so
@@ -515,7 +515,7 @@ fn map_search_item(item: &SearchItem) -> Option<ShowResource> {
         first_aired,
         tv_maze_id: remote("TV Maze").and_then(|v| v.parse().ok()),
         tmdb_id: remote("TheMovieDB.com").and_then(|v| v.parse().ok()),
-        imdb_id: remote("IMDB").filter(|id| !id.trim().is_empty()),
+        imdb_id: remote("IMDB").filter(|id| is_valid_imdb_id(id)),
         status: Some(String::new()),
         network: item.network.clone(),
         original_language: item.primary_language.clone(),
@@ -712,7 +712,7 @@ fn map_show(
             .latest_network
             .as_ref()
             .and_then(|n| n.name.clone()),
-        imdb_id: remote("IMDB").filter(|id| !id.trim().is_empty()),
+        imdb_id: remote("IMDB").filter(|id| is_valid_imdb_id(id)),
         original_language: extended.original_language.clone(),
         original_country: extended.original_country.clone(),
         daily: extended
@@ -1006,6 +1006,29 @@ mod tests {
         assert_eq!(show.ani_list_ids, vec![789]);
         assert_eq!(show.anidb_ids, vec![42]);
         assert_eq!(show.imdb_id.as_deref(), Some("tt1"));
+    }
+
+    #[test]
+    fn drops_invalid_upstream_imdb_id() {
+        let raw = r#"{"data":{"id":1,"name":"Show","remoteIds":[{"sourceName":"IMDB","id":"tt12345678901"}]}}"#;
+        let extended = serde_json::from_str::<Envelope<SeriesExtended>>(raw)
+            .unwrap()
+            .data;
+        assert_eq!(
+            map_show(1, &extended, None, Vec::new(), None, &BTreeMap::new()).imdb_id,
+            None
+        );
+
+        let raw = r#"{"data":{"id":1,"name":"Show","remoteIds":[{"sourceName":"IMDB","id":"tt0000002"}]}}"#;
+        let extended = serde_json::from_str::<Envelope<SeriesExtended>>(raw)
+            .unwrap()
+            .data;
+        assert_eq!(
+            map_show(1, &extended, None, Vec::new(), None, &BTreeMap::new())
+                .imdb_id
+                .as_deref(),
+            Some("tt0000002")
+        );
     }
 
     #[test]
