@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -16,7 +16,10 @@ use bytes::Bytes;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{
+    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 use crate::{error::AppError, inbound::InboundLimiter, state::AppState};
 
@@ -66,6 +69,7 @@ pub fn router(state: AppState) -> Router {
             api_auth_middleware,
         ))
         .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             request_timeout,
@@ -254,9 +258,7 @@ async fn proxy(
     method: Method,
 ) -> Result<Response, AppError> {
     if method != Method::GET && method != Method::HEAD {
-        return Err(AppError::Internal(format!(
-            "method {method} is not supported"
-        )));
+        return Ok(StatusCode::METHOD_NOT_ALLOWED.into_response());
     }
 
     let mut path_and_query = format!("/{}", path.trim_start_matches('/'));
@@ -280,10 +282,24 @@ async fn proxy(
         "miss"
     };
 
+    let is_json = response
+        .content_type
+        .as_deref()
+        .is_some_and(|content_type| {
+            content_type
+                .to_ascii_lowercase()
+                .contains("application/json")
+        });
+
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY))
         .header("x-providarr-cache", cache_state)
-        .header("x-providarr-provider", provider);
+        .header("x-providarr-provider", provider)
+        .header("x-content-type-options", "nosniff")
+        .header(
+            header::CONTENT_DISPOSITION,
+            if is_json { "inline" } else { "attachment" },
+        );
 
     if response.replayed {
         builder = builder.header("x-providarr-replay", "true");
@@ -322,13 +338,29 @@ async fn radarr_movie(
     json_value_report(&movie?, &report)
 }
 
+const MAX_BULK_IDS: usize = 100;
+
 async fn radarr_movie_bulk(
     State(state): State<AppState>,
     Json(ids): Json<Vec<i64>>,
 ) -> Result<Response, AppError> {
+    if ids.len() > MAX_BULK_IDS {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "too many ids",
+                "max": MAX_BULK_IDS,
+            })),
+        )
+            .into_response());
+    }
+
     if state.config.replay.enabled {
         return metadata_fixture(&state, "movie", None);
     }
+
+    let mut seen = HashSet::new();
+    let ids: Vec<i64> = ids.into_iter().filter(|id| seen.insert(*id)).collect();
 
     let movies = crate::mapper::bulk(&state, &ids).await?;
     json_value(&movies)
@@ -492,12 +524,16 @@ async fn api_auth_middleware(
 ) -> Response {
     let auth = &state.config.api_auth;
     let path = request.uri().path();
-    if auth.enabled && !auth.api_key.is_empty() && path != "/health" && path != "/v1/policy" {
+    if auth.enabled && path != "/health" && path != "/v1/policy" {
         let provided = request
             .headers()
             .get(auth.header.as_str())
             .and_then(|value| value.to_str().ok());
-        if !provided.is_some_and(|provided| constant_time_eq(provided, &auth.api_key)) {
+        // Fail closed: an empty configured key means the server is
+        // misconfigured, so reject rather than silently allowing every request.
+        if auth.api_key.is_empty()
+            || !provided.is_some_and(|provided| constant_time_eq(provided, &auth.api_key))
+        {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "unauthorized" })),
@@ -522,8 +558,16 @@ async fn inbound_middleware(
     let path = request.uri().path().to_string();
 
     let Some(ip) = client_ip(&request, &state.inbound) else {
-        tracing::debug!(method = %method, path = %path, "inbound request had no resolvable client IP; limiter skipped");
-        return next.run(request).await;
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            "inbound request had no resolvable client IP; failing closed"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "client address unavailable" })),
+        )
+            .into_response();
     };
 
     if state.inbound.is_bypassed(ip) {
@@ -632,14 +676,19 @@ fn client_ip(request: &axum::extract::Request, inbound: &InboundLimiter) -> Opti
 
     let forwarded_for = request
         .headers()
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok());
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+    let forwarded_for = (!forwarded_for.is_empty()).then_some(forwarded_for);
+
     let real_ip = request
         .headers()
         .get("x-real-ip")
         .and_then(|value| value.to_str().ok());
 
-    Some(inbound.resolve_client_ip(peer, forwarded_for, real_ip))
+    Some(inbound.resolve_client_ip(peer, forwarded_for.as_deref(), real_ip))
 }
 
 async fn not_found() -> impl IntoResponse {
