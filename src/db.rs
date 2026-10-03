@@ -12,6 +12,11 @@ use crate::{config::DatabaseConfig, error::AppError, ratelimit::stats::EndpointS
 /// and startup memory stays bounded even if the table has grown large.
 const STARTUP_ENDPOINT_STATS_LIMIT: i64 = 50_000;
 
+/// Number of rows deleted per statement during retention pruning. Deletes in
+/// bounded batches so a large backlog cannot hold one unbounded transaction (and
+/// its locks) against the audit/stats tables.
+const PRUNE_BATCH_SIZE: i64 = 10_000;
+
 pub async fn connect(cfg: &DatabaseConfig) -> Result<PgPool, AppError> {
     let url = resolve_connection_url(cfg)?;
     let pool = PgPoolOptions::new()
@@ -25,26 +30,38 @@ pub async fn connect(cfg: &DatabaseConfig) -> Result<PgPool, AppError> {
 
 /// Applies the TLS policy from `DatabaseConfig` to the connection URL.
 ///
-/// When `require_tls` is set, `sslmode=require` is appended unless the URL
-/// already specifies an `sslmode`/`ssl-mode`. Otherwise a non-loopback host
-/// without an explicit sslmode gets a warning recommending TLS.
+/// The URL is parsed so the *effective* `sslmode`/`ssl-mode` query parameter is
+/// read (rather than string-matching anywhere in the URL, which a password or
+/// path containing `sslmode=` could spoof). When `require_tls` is set the
+/// effective mode must be one of `require`, `verify-ca`, `verify-full`; a
+/// missing mode is set and an insecure mode (`disable`/`allow`/`prefer`) is
+/// rejected. Otherwise a non-loopback host without an explicit sslmode gets a
+/// warning recommending TLS.
 fn resolve_connection_url(cfg: &DatabaseConfig) -> Result<String, AppError> {
-    let has_sslmode = cfg.url.contains("sslmode=") || cfg.url.contains("ssl-mode=");
+    let mut url = url::Url::parse(&cfg.url)
+        .map_err(|e| AppError::Config(format!("database.url is not a valid URL: {e}")))?;
+    let sslmodes = sslmode_values(&url);
+
     if cfg.require_tls {
-        if has_sslmode {
-            return Ok(cfg.url.clone());
+        if sslmodes.is_empty() {
+            // `query_pairs_mut` rebuilds the query and preserves any fragment.
+            url.query_pairs_mut().append_pair("sslmode", "require");
+            tracing::info!(
+                "database.require_tls is enabled; setting sslmode=require on the connection URL"
+            );
+            return Ok(url.to_string());
         }
-        let separator = if cfg.url.contains('?') { '&' } else { '?' };
-        let url = format!("{}{separator}sslmode=require", cfg.url);
-        tracing::info!(
-            "database.require_tls is enabled; appending sslmode=require to the connection URL"
-        );
-        return Ok(url);
+        if let Some(bad) = sslmodes.iter().find(|mode| !is_secure_sslmode(mode)) {
+            return Err(AppError::Config(format!(
+                "database.require_tls is enabled but database.url requests sslmode={bad:?}; \
+                 use one of require, verify-ca, verify-full"
+            )));
+        }
+        return Ok(cfg.url.clone());
     }
 
-    if !has_sslmode
-        && let Some(host) = database_host(&cfg.url)
-        && !is_loopback_host(&host)
+    if sslmodes.is_empty()
+        && let Some(host) = non_loopback_database_host(&url)
     {
         tracing::warn!(
             host = %host,
@@ -54,8 +71,59 @@ fn resolve_connection_url(cfg: &DatabaseConfig) -> Result<String, AppError> {
     Ok(cfg.url.clone())
 }
 
-fn database_host(url: &str) -> Option<String> {
-    url::Url::parse(url).ok()?.host_str().map(str::to_string)
+/// All `sslmode`/`ssl-mode` values present in the query string (including an
+/// explicitly empty `sslmode=`).
+fn sslmode_values(url: &url::Url) -> Vec<String> {
+    url.query_pairs()
+        .filter(|(key, _)| key == "sslmode" || key == "ssl-mode")
+        .map(|(_, value)| value.into_owned())
+        .collect()
+}
+
+fn is_secure_sslmode(mode: &str) -> bool {
+    matches!(
+        mode.to_ascii_lowercase().as_str(),
+        "require" | "verify-ca" | "verify-full"
+    )
+}
+
+/// Returns the first non-loopback host referenced by the URL, considering both
+/// the authority and libpq `host=`/`hostaddr=` query parameters.
+fn non_loopback_database_host(url: &url::Url) -> Option<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    if let Some(host) = url.host_str()
+        && !host.is_empty()
+    {
+        hosts.push(host.to_string());
+    }
+    for (key, value) in url.query_pairs() {
+        if key == "host" || key == "hostaddr" {
+            for part in value.split(',') {
+                let part = part.trim();
+                if !part.is_empty() {
+                    hosts.push(part.to_string());
+                }
+            }
+        }
+    }
+    hosts
+        .into_iter()
+        .find(|host| !is_loopback_host(host_without_port(host)))
+}
+
+/// Strips a `host:port` suffix so the host can be classified. Handles bracketed
+/// IPv6 (`[::1]:5432`).
+fn host_without_port(raw: &str) -> &str {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match raw.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
+            host
+        }
+        _ => raw,
+    }
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -173,30 +241,58 @@ pub async fn insert_rate_limit_event(
     Ok(())
 }
 
-/// Delete endpoint-stat rows that have not been updated within `older_than`.
-/// Returns the number of rows removed. The cutoff is computed in Postgres and
-/// passed as a bound interval parameter; the predicate is sargable against
-/// `endpoint_stats_updated_at_idx`.
+/// Delete endpoint-stat rows that have not been updated within `older_than`,
+/// in bounded batches. Returns the total number of rows removed. The cutoff is
+/// computed in Postgres and passed as a bound interval parameter; the predicate
+/// is sargable against `endpoint_stats_updated_at_idx`. Each batch is its own
+/// short transaction so a large backlog cannot hold one unbounded delete.
 pub async fn prune_endpoint_stats(pool: &PgPool, older_than: Duration) -> Result<u64, AppError> {
-    let result = sqlx::query(
-        "DELETE FROM endpoint_stats WHERE updated_at < now() - make_interval(secs => $1)",
-    )
-    .bind(older_than.as_secs_f64())
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    let mut total: u64 = 0;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM endpoint_stats WHERE ctid IN ( \
+                 SELECT ctid FROM endpoint_stats \
+                 WHERE updated_at < now() - make_interval(secs => $1) \
+                 LIMIT $2\
+             )",
+        )
+        .bind(older_than.as_secs_f64())
+        .bind(PRUNE_BATCH_SIZE)
+        .execute(pool)
+        .await?;
+        let deleted = result.rows_affected();
+        total = total.saturating_add(deleted);
+        if deleted < PRUNE_BATCH_SIZE as u64 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
-/// Delete rate-limit audit rows older than `older_than`. Returns the number of
-/// rows removed. Backed by `rate_limit_events_occurred_at_idx`.
+/// Delete rate-limit audit rows older than `older_than`, in bounded batches.
+/// Returns the total number of rows removed. Backed by
+/// `rate_limit_events_occurred_at_idx`.
 pub async fn prune_rate_limit_events(pool: &PgPool, older_than: Duration) -> Result<u64, AppError> {
-    let result = sqlx::query(
-        "DELETE FROM rate_limit_events WHERE occurred_at < now() - make_interval(secs => $1)",
-    )
-    .bind(older_than.as_secs_f64())
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    let mut total: u64 = 0;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM rate_limit_events WHERE id IN ( \
+                 SELECT id FROM rate_limit_events \
+                 WHERE occurred_at < now() - make_interval(secs => $1) \
+                 LIMIT $2\
+             )",
+        )
+        .bind(older_than.as_secs_f64())
+        .bind(PRUNE_BATCH_SIZE)
+        .execute(pool)
+        .await?;
+        let deleted = result.rows_affected();
+        total = total.saturating_add(deleted);
+        if deleted < PRUNE_BATCH_SIZE as u64 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 pub async fn ping(pool: &PgPool) -> Result<(), AppError> {
@@ -359,6 +455,69 @@ mod tests {
         };
         let url = resolve_connection_url(&cfg).unwrap();
         assert!(url.ends_with("&sslmode=require"), "{url}");
+    }
+
+    #[test]
+    fn require_tls_rejects_insecure_sslmode() {
+        for raw in [
+            "postgres://user:pw@db.example.com:5432/providarr?sslmode=disable",
+            "postgres://user:pw@db.example.com:5432/providarr?sslmode=allow",
+            "postgres://user:pw@db.example.com:5432/providarr?sslmode=prefer",
+            "postgres://user:pw@db.example.com:5432/providarr?ssl-mode=disable",
+            "postgres://user:pw@db.example.com:5432/providarr?sslmode=",
+        ] {
+            let cfg = DatabaseConfig {
+                url: raw.into(),
+                require_tls: true,
+                ..DatabaseConfig::default()
+            };
+            assert!(
+                resolve_connection_url(&cfg).is_err(),
+                "insecure sslmode should be rejected: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_tls_ignores_sslmode_in_password() {
+        // A password containing `sslmode=disable` must not spoof the check.
+        let cfg = DatabaseConfig {
+            url: "postgres://user:sslmode=disable@db.example.com:5432/providarr".into(),
+            require_tls: true,
+            ..DatabaseConfig::default()
+        };
+        let url = resolve_connection_url(&cfg).unwrap();
+        assert!(url.contains("sslmode=require"), "{url}");
+    }
+
+    #[test]
+    fn require_tls_handles_fragment() {
+        let cfg = DatabaseConfig {
+            url: "postgres://user:pw@db.example.com:5432/providarr#frag".into(),
+            require_tls: true,
+            ..DatabaseConfig::default()
+        };
+        let url = resolve_connection_url(&cfg).unwrap();
+        assert!(url.contains("?sslmode=require"), "{url}");
+        assert!(url.ends_with("#frag"), "{url}");
+    }
+
+    #[test]
+    fn non_loopback_detection_considers_query_hosts() {
+        let url =
+            url::Url::parse("postgres://127.0.0.1:5432/providarr?host=db.example.com").unwrap();
+        assert_eq!(
+            non_loopback_database_host(&url).as_deref(),
+            Some("db.example.com")
+        );
+
+        let url =
+            url::Url::parse("postgres://127.0.0.1:5432/providarr?hostaddr=127.0.0.1").unwrap();
+        assert_eq!(non_loopback_database_host(&url), None);
+
+        assert_eq!(host_without_port("127.0.0.1:5432"), "127.0.0.1");
+        assert_eq!(host_without_port("[::1]:5432"), "::1");
+        assert_eq!(host_without_port("db.example.com"), "db.example.com");
     }
 
     #[test]

@@ -49,7 +49,7 @@
     "global_burst": 200,
     "max_concurrent": 128,
     "trust_forwarded_for": false,
-    "bypass": ["127.0.0.1", "::1"]
+    "bypass": []
   },
   "api_auth": {
     "enabled": false,

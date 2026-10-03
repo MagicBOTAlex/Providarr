@@ -11,6 +11,10 @@ const MAX_RETRIES_CAP: u32 = 20;
 /// Upper bound on `inbound.max_concurrent`.
 const MAX_CONCURRENT_CAP: u32 = 65_535;
 
+/// Upper bound on `providers.*.max_concurrency` (matches the inbound cap) so a
+/// hostile config cannot overflow or panic `Semaphore::new`.
+const MAX_PROVIDER_CONCURRENCY_CAP: usize = 65_535;
+
 /// Upper bound on `search.hydrate_limit` so a misconfiguration cannot make a
 /// single search hydrate the whole provider result set.
 const MAX_HYDRATE_LIMIT: usize = 100;
@@ -21,6 +25,10 @@ const MAX_BACKOFF_MAX_DELAY: Duration = Duration::from_secs(3_600);
 
 /// Upper bound on `backoff.max_request_timeout` (10 minutes).
 const MAX_BACKOFF_MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Upper bound on `backoff.drop_after_wait` (1 hour) so a hostile config cannot
+/// pin an inbound request for an effectively unbounded time.
+const MAX_DROP_AFTER_WAIT: Duration = Duration::from_secs(3_600);
 
 /// Upper bound on `backoff.max_consecutive_failures` so a hostile config cannot
 /// pin a provider in an effectively unbounded lockout.
@@ -100,6 +108,26 @@ fn redact_database_url(raw: &str) -> String {
             if url.password().is_some() {
                 let _ = url.set_password(Some("***"));
             }
+            // Secrets may also travel as query parameters (libpq accepts
+            // `?password=`/`?sslpassword=`); mask those too so a `Debug` log line
+            // never carries them.
+            let pairs: Vec<(String, String)> = url
+                .query_pairs()
+                .map(|(key, value)| {
+                    let value = if matches!(key.as_ref(), "password" | "sslpassword") {
+                        "***".to_string()
+                    } else {
+                        value.into_owned()
+                    };
+                    (key.into_owned(), value)
+                })
+                .collect();
+            if pairs
+                .iter()
+                .any(|(key, _)| matches!(key.as_str(), "password" | "sslpassword"))
+            {
+                url.query_pairs_mut().clear().extend_pairs(pairs);
+            }
             url.to_string()
         }
         Err(_) => "<redacted>".to_string(),
@@ -127,8 +155,13 @@ impl AppConfig {
     /// A missing file is not fatal: built-in defaults are used. Environment
     /// variables override the values that matter for deployment.
     pub fn load() -> Result<Self, AppError> {
-        let path =
-            std::env::var("PROVIDARR_CONFIG").unwrap_or_else(|_| "config/config.json".to_string());
+        // An explicitly-set `PROVIDARR_CONFIG` is authoritative: if it points at
+        // a missing file that is a hard error, not a silent fall back to
+        // defaults. Only the implicit default path may be absent.
+        let explicit_config = std::env::var("PROVIDARR_CONFIG").ok();
+        let path = explicit_config
+            .clone()
+            .unwrap_or_else(|| "config/config.json".to_string());
 
         // `symlink_metadata` does not follow symlinks, so a symlinked config is
         // rejected instead of silently resolved. A missing file keeps the
@@ -157,6 +190,11 @@ impl AppConfig {
                     .map_err(|e| AppError::Config(format!("failed to parse {path}: {e}")))?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if explicit_config.is_some() {
+                    return Err(AppError::Config(format!(
+                        "config file {path:?} from PROVIDARR_CONFIG does not exist"
+                    )));
+                }
                 tracing::warn!(path, "config file not found, using defaults");
                 AppConfig::default()
             }
@@ -264,6 +302,13 @@ impl AppConfig {
                 backoff.max_request_timeout.as_secs()
             )));
         }
+        if backoff.drop_after_wait > MAX_DROP_AFTER_WAIT {
+            return Err(AppError::Config(format!(
+                "backoff.drop_after_wait must be <= {}s (got {}s)",
+                MAX_DROP_AFTER_WAIT.as_secs(),
+                backoff.drop_after_wait.as_secs()
+            )));
+        }
 
         for (name, provider) in &self.providers {
             if provider.base_url.trim().is_empty() {
@@ -284,6 +329,12 @@ impl AppConfig {
             if provider.max_concurrency == 0 {
                 return Err(AppError::Config(format!(
                     "providers.{name}.max_concurrency must be > 0"
+                )));
+            }
+            if provider.max_concurrency > MAX_PROVIDER_CONCURRENCY_CAP {
+                return Err(AppError::Config(format!(
+                    "providers.{name}.max_concurrency must be <= {MAX_PROVIDER_CONCURRENCY_CAP} (got {})",
+                    provider.max_concurrency
                 )));
             }
             for (segment, rps) in &provider.endpoint_rps {
@@ -330,6 +381,12 @@ impl AppConfig {
                 inbound.max_concurrent
             )));
         }
+        if !inbound.bypass.is_empty() {
+            tracing::warn!(
+                rules = ?inbound.bypass,
+                "inbound.bypass is non-empty; matching clients are exempt from the per-IP rate limiter"
+            );
+        }
 
         if self.cache.max_body_bytes == 0 {
             return Err(AppError::Config("cache.max_body_bytes must be > 0".into()));
@@ -355,6 +412,11 @@ impl AppConfig {
         if self.cache.stale_if_error > self.cache.max_ttl {
             return Err(AppError::Config(
                 "cache.stale_if_error must be <= cache.max_ttl".into(),
+            ));
+        }
+        if self.cache.negative_stale_if_error > self.cache.max_ttl {
+            return Err(AppError::Config(
+                "cache.negative_stale_if_error must be <= cache.max_ttl".into(),
             ));
         }
 
@@ -432,18 +494,30 @@ fn apply_inbound_env_overrides(config: &mut AppConfig) -> Result<(), AppError> {
 /// Reads an environment variable and parses it, returning `Ok(None)` when it is
 /// unset and an error when it is set but cannot be parsed.
 fn env_parse<T>(name: &str, parse: impl Fn(&str) -> Option<T>) -> Result<Option<T>, AppError> {
-    match std::env::var(name) {
-        Ok(raw) => parse(&raw).map(Some).ok_or_else(|| {
-            AppError::Config(format!("{name} is set but not a valid value: {raw:?}"))
+    parse_env_value(name, std::env::var(name).ok().as_deref(), parse)
+}
+
+/// Parses an environment value. An empty/whitespace-only value is treated as
+/// unset (returns `Ok(None)`) rather than as a parse failure or, worse, as
+/// `false`: `PROVIDARR_API_AUTH_ENABLED=` must not silently disable auth.
+fn parse_env_value<T>(
+    name: &str,
+    raw: Option<&str>,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>, AppError> {
+    match raw {
+        Some(value) if value.trim().is_empty() => Ok(None),
+        Some(value) => parse(value).map(Some).ok_or_else(|| {
+            AppError::Config(format!("{name} is set but not a valid value: {value:?}"))
         }),
-        Err(_) => Ok(None),
+        None => Ok(None),
     }
 }
 
 fn parse_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" | "" => Some(false),
+        "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
 }
@@ -966,9 +1040,26 @@ impl ProviderConfig {
     }
 }
 
+/// Fallback used for *deserialized* provider entries that omit fields. It
+/// deliberately does not inherit the TMDb credentials or URL: an unnamed or
+/// partially-specified provider must fail closed (empty `base_url`) and never
+/// send one provider's token to another provider's endpoint (`auth: None`).
+/// The built-in `tmdb`/`tvdb` entries are built explicitly via
+/// `tmdb_default`/`tvdb_default`, so their behaviour is unchanged.
 impl Default for ProviderConfig {
     fn default() -> Self {
-        Self::tmdb_default()
+        Self {
+            base_url: String::new(),
+            requests_per_second: 40.0,
+            burst: 40,
+            max_concurrency: 8,
+            request_timeout: Duration::from_secs(15),
+            connect_timeout: Duration::from_secs(5),
+            documented_rate_limit: "~50 requests/second per API key (documented; not probed)"
+                .to_string(),
+            auth: AuthConfig::None,
+            endpoint_rps: HashMap::new(),
+        }
     }
 }
 
@@ -1191,6 +1282,25 @@ mod tests {
             ..ApiAuthConfig::default()
         };
         assert!(format!("{empty:?}").contains("<empty>"));
+
+        // Query-string secrets must be masked too, including when a password is
+        // also present in the userinfo.
+        let query_db = DatabaseConfig {
+            url: "postgres://user:hunter2@db.example.com:5432/providarr?password=querysecret&sslpassword=sslsecret&application_name=providarr"
+                .to_string(),
+            ..DatabaseConfig::default()
+        };
+        let rendered = format!("{query_db:?}");
+        assert!(!rendered.contains("hunter2"), "userinfo leaked: {rendered}");
+        assert!(
+            !rendered.contains("querysecret"),
+            "query password leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sslsecret"),
+            "sslpassword leaked: {rendered}"
+        );
+        assert!(rendered.contains("application_name=providarr"));
     }
 
     #[test]
@@ -1277,5 +1387,82 @@ mod tests {
         let raw = r#"{"database": {"require_tls": true}}"#;
         let config: AppConfig = serde_json::from_str(raw).unwrap();
         assert!(config.database.require_tls);
+    }
+
+    #[test]
+    fn empty_env_values_are_treated_as_unset() {
+        // Empty must not silently mean a boolean `false`.
+        assert_eq!(parse_bool(""), None);
+        assert_eq!(parse_bool("   "), None);
+        assert_eq!(
+            parse_env_value::<bool>("X", Some(""), parse_bool).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_env_value::<bool>("X", Some("  "), parse_bool).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_env_value::<bool>("X", Some("false"), parse_bool).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            parse_env_value::<bool>("X", Some("true"), parse_bool).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse_env_value::<bool>("X", None, parse_bool).unwrap(),
+            None
+        );
+        // A non-empty, non-boolean value is still a hard error.
+        assert!(parse_env_value::<bool>("X", Some("maybe"), parse_bool).is_err());
+    }
+
+    #[test]
+    fn omitted_provider_auth_defaults_to_none_and_base_url_is_empty() {
+        let raw = r#"{"providers": {"evil": {"requests_per_second": 1.0}}}"#;
+        let config: AppConfig = serde_json::from_str(raw).unwrap();
+        let provider = config.providers.get("evil").unwrap();
+        assert_eq!(provider.auth, AuthConfig::None);
+        assert!(provider.base_url.is_empty());
+        // A provider with no base_url fails closed.
+        assert!(config.validate().is_err());
+
+        // The built-in entries keep their real credentials.
+        let builtin = AppConfig::default();
+        assert_eq!(
+            builtin.providers["tmdb"].auth,
+            AuthConfig::Bearer {
+                env_var: "TMDB_API_TOKEN".to_string()
+            }
+        );
+        assert_eq!(
+            builtin.providers["tvdb"].auth,
+            AuthConfig::TvdbLogin {
+                env_var: "TVDB_API_KEY".to_string()
+            }
+        );
+
+        // An explicitly configured auth style still parses.
+        let raw = r#"{"providers": {"x": {"base_url": "https://x.example.com", "auth": {"style": "none"}}}}"#;
+        let config: AppConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(config.providers["x"].auth, AuthConfig::None);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_caps_provider_concurrency_and_stale_window() {
+        let mut config = AppConfig::default();
+        config.providers.get_mut("tmdb").unwrap().max_concurrency =
+            MAX_PROVIDER_CONCURRENCY_CAP + 1;
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.backoff.drop_after_wait = MAX_DROP_AFTER_WAIT + Duration::from_secs(1);
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.cache.negative_stale_if_error = config.cache.max_ttl + Duration::from_secs(1);
+        assert!(config.validate().is_err());
     }
 }
