@@ -43,7 +43,7 @@ uuid = { version = "1.26.1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"
-postgresql_embedded = { version = "0.21", default-features = false, features = ["theseus", "tokio", "tls-rustls-ring"] }
+postgresql_embedded = { version = "0.22", default-features = false, features = ["theseus", "tokio", "tls-rustls-ring"] }
 pretty_assertions = "1.4.1"
 serial_test = "4.0.1"
 tempfile = "3.27.0"
